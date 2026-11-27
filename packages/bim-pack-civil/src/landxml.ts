@@ -16,8 +16,14 @@ import type { GradingSurface, SurfaceRole, TinFace, TinVertex } from "./surfaces
 /** 1 US survey foot in metres, exactly. */
 export const US_SURVEY_FOOT_METRES = 1200 / 3937;
 
-/** How many triangles one surface may carry. The volume pass compares every pair; this keeps that pass a site TIN. */
+/** How many triangles one surface may carry. Keeps the surface sized for a site TIN. */
 export const MAX_TIN_FACES = 8000;
+
+/** How many vertices one surface may carry alongside `MAX_TIN_FACES`. */
+export const MAX_TIN_POINTS = 16000;
+
+/** Maximum XML element nesting depth allowed during LandXML parsing. */
+export const MAX_XML_DEPTH = 64;
 
 const LINEAR_UNITS: ReadonlyMap<string, UnitFor<"length"> | "ussurveyfoot"> = new Map([
   ["millimeter", "mm"],
@@ -139,7 +145,8 @@ function parseXml(source: string): XmlNode {
       i += 1;
     }
   };
-  const parseElement = (): XmlNode => {
+  const parseElement = (depth: number): XmlNode => {
+    if (depth > MAX_XML_DEPTH) fail(`This XML file is nested more than ${MAX_XML_DEPTH} levels deep`);
     skipMisc();
     if (s.charAt(i) !== "<" || s.startsWith("</", i)) fail("Expected an element");
     i += 1;
@@ -156,6 +163,18 @@ function parseXml(source: string): XmlNode {
     const children: XmlNode[] = [];
     for (;;) {
       if (i >= s.length) fail(`<${name}> never closes`);
+      if (s.startsWith("<!--", i)) {
+        const end = s.indexOf("-->", i + 4);
+        if (end < 0) fail("A comment never closes");
+        i = end + 3;
+        continue;
+      }
+      if (s.startsWith("<?", i)) {
+        const end = s.indexOf("?>", i + 2);
+        if (end < 0) fail("The XML declaration never closes");
+        i = end + 2;
+        continue;
+      }
       if (s.startsWith("</", i)) {
         i += 2;
         const close = localName(readName());
@@ -166,7 +185,7 @@ function parseXml(source: string): XmlNode {
         return { name, attrs, children, text: decodeEntities(text).trim() };
       }
       if (s.charAt(i) === "<") {
-        children.push(parseElement());
+        children.push(parseElement(depth + 1));
         continue;
       }
       const start = i;
@@ -176,7 +195,7 @@ function parseXml(source: string): XmlNode {
   };
   skipMisc();
   if (i >= s.length || s.charAt(i) !== "<") fail("This isn't a LandXML file. Save the surface as LandXML 1.2 and import it again");
-  const root = parseElement();
+  const root = parseElement(0);
   skipMisc();
   if (i < s.length) fail("There's more than one top-level element");
   return root;
@@ -293,12 +312,16 @@ function readSurface(node: XmlNode, unit: FileUnit, roles: LandXmlOptions["roles
     problems.push(`${name} needs at least three points.`);
     return null;
   }
+  if (pointNodes.length > MAX_TIN_POINTS) {
+    problems.push(`${name} has ${pointNodes.length} points. Keep each site TIN surface under ${MAX_TIN_POINTS} points.`);
+    return null;
+  }
   if (faceNodes.length < 1) {
     problems.push(`${name} needs at least one triangle.`);
     return null;
   }
   if (faceNodes.length > MAX_TIN_FACES) {
-    problems.push(`${name} has ${faceNodes.length} triangles. This cut and fill compares every triangle of one surface with every triangle of the other, so keep each surface under ${MAX_TIN_FACES} triangles.`);
+    problems.push(`${name} has ${faceNodes.length} triangles. Keep each site TIN surface under ${MAX_TIN_FACES} triangles.`);
     return null;
   }
   const byId = new Map<string, number>();
@@ -327,7 +350,13 @@ function readSurface(node: XmlNode, unit: FileUnit, roles: LandXmlOptions["roles
     points.push({ id, easting: qty("length", easting, u), northing: qty("length", northing, u), elevation: qty("length", elevation, u) });
   }
   const faces: TinFace[] = [];
+  let invisible = 0;
   for (const [index, f] of faceNodes.entries()) {
+    // LandXML 1.2 marks hidden/trimmed TIN faces (boundary cutouts, voids) with i="1".
+    if (f.attrs.i?.trim() === "1") {
+      invisible += 1;
+      continue;
+    }
     const raw = f.text.trim().split(/\s+/).filter((part) => part !== "");
     if (raw.length !== 3) {
       problems.push(`${name}: face ${index + 1} should be three point ids. It says "${f.text}".`);
@@ -340,6 +369,13 @@ function readSurface(node: XmlNode, unit: FileUnit, roles: LandXmlOptions["roles
       return null;
     }
     faces.push({ a: ids[0]!, b: ids[1]!, c: ids[2]! });
+  }
+  if (invisible > 0) {
+    notes.push(`${name}: skipped ${invisible} invisible ${invisible === 1 ? "face" : "faces"} (i="1").`);
+  }
+  if (faces.length < 1) {
+    problems.push(`${name} has no visible triangles.`);
+    return null;
   }
   if (planArea(points, faces) <= 0) {
     problems.push(`${name}'s triangles cover no ground. A vertical face or a repeated point adds no area.`);

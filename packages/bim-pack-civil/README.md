@@ -68,11 +68,12 @@ licensed civil engineer has reviewed it. Issue
 label for that reason. The calc repeats the warning on every run.
 
 **Not in this slice.** Spot elevations and slopes as their own objects, contours, corridors,
-mass haul, a shrink or swell factor, and drawing the TIN in plan or 3D. The comparison is every
-triangle against every triangle, so each surface stays under 8,000 triangles (`MAX_TIN_FACES`).
-That pass is on demand; it is not an edit of the building model and it does not scan the other
-elements. Overlapping triangles inside one surface are counted twice — a TIN shouldn't do that,
-and this slice doesn't check.
+mass haul, a shrink or swell factor, and drawing the TIN in plan or 3D. A 2D uniform grid and
+per-triangle AABB prefilter prune non-overlapping triangle pairs, and each surface stays under
+8,000 triangles (`MAX_TIN_FACES`) and 16,000 vertices (`MAX_TIN_POINTS`). LandXML 1.2 invisible
+faces (`i="1"`) are skipped with a note. That pass is on demand; it is not an edit of the
+building model and it does not scan the other elements. Overlapping triangles inside one surface
+are counted twice — a TIN shouldn't do that, and this slice doesn't check.
 
 ### Kernel gaps this slice did not paper over by editing the kernel
 

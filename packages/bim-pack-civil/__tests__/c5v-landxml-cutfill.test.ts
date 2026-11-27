@@ -36,7 +36,7 @@ import { qty, to, type UnitFor } from "@permitzip/bim-units";
 import { commandSchema, DEFAULT_SETTINGS, planCommit, withUpgradePolicy, type ModelState } from "@permitzip/bim-kernel";
 import { bindModelPacks, PackSet, runPackCalc, withPackSet } from "@permitzip/bim-pack";
 import { IMPORT_LANDXML_SURFACES } from "../src/grading-command";
-import { importLandXml } from "../src/landxml";
+import { importLandXml, MAX_TIN_POINTS, MAX_XML_DEPTH } from "../src/landxml";
 import { CIVIL_PACK } from "../src/pack";
 import { readGradingSurfaces, type GradingSurface, type SurfaceRole, type TinFace, type TinVertex } from "../src/surfaces";
 import { cutFillBetween } from "../src/tin-volume";
@@ -305,5 +305,75 @@ describe("grading surfaces in the model", () => {
     const head = empty();
     expect(() => commit(head, { type: IMPORT_LANDXML_SURFACES, landXml: "hello" })).toThrow(/isn't a LandXML/);
     expect(Object.keys(head.elements)).toEqual([]);
+  });
+
+  it("skips LandXML 1.2 invisible faces (i=\"1\") and accepts trailing XML comments", () => {
+    const xml = `<?xml version="1.0"?>
+      <LandXML version="1.2">
+        <Units><Imperial linearUnit="foot"/></Units>
+        <Surfaces>
+          <Surface name="Existing"><Definition surfType="TIN">
+            <Pnts><P id="1">0 0 0</P><P id="2">0 10 0</P><P id="3">10 10 0</P><P id="4">10 0 0</P><!-- trailing --></Pnts>
+            <Faces><F>1 2 3</F><F i="1">1 3 4</F><!-- trailing --></Faces>
+          </Definition></Surface>
+          <Surface name="Proposed"><Definition surfType="TIN">
+            <Pnts><P id="1">0 0 1</P><P id="2">0 10 1</P><P id="3">10 10 1</P><P id="4">10 0 1</P></Pnts>
+            <Faces><F>1 2 3</F><F i="1">1 3 4</F></Faces>
+          </Definition></Surface>
+          <!-- trailing -->
+        </Surfaces>
+      </LandXML>`;
+    const imported = importLandXml(xml);
+    expect(imported.problems).toEqual([]);
+    expect(imported.notes.some((n) => /skipped 1 invisible face/.test(n))).toBe(true);
+    const [existing, proposed] = imported.surfaces;
+    if (!existing || !proposed) throw new Error("expected both surfaces");
+    expect(existing.faces).toHaveLength(1);
+    const result = cutFillBetween(existing, proposed);
+    expect(to(result.fill, "ft3")).toBeCloseTo(50, 4);
+  });
+
+  it("enforces XML nesting depth and vertex count caps", () => {
+    const tooDeep = "<a>".repeat(MAX_XML_DEPTH + 2) + "</a>".repeat(MAX_XML_DEPTH + 2);
+    const deepRes = importLandXml(tooDeep);
+    expect(deepRes.surfaces).toEqual([]);
+    expect(deepRes.problems.join(" ")).toMatch(/nested more than/);
+
+    const pts = Array.from({ length: MAX_TIN_POINTS + 1 }, (_, i) => `<P id="${i + 1}">0 ${i} 0</P>`).join("");
+    const tooManyPts = `<LandXML version="1.2"><Units><Imperial linearUnit="foot"/></Units><Surfaces><Surface name="Huge"><Definition surfType="TIN"><Pnts>${pts}</Pnts><Faces><F>1 2 3</F></Faces></Definition></Surface></Surfaces></LandXML>`;
+    const ptsRes = importLandXml(tooManyPts);
+    expect(ptsRes.surfaces).toEqual([]);
+    expect(ptsRes.problems.join(" ")).toMatch(new RegExp(`${MAX_TIN_POINTS} points`));
+  });
+
+  it("uses the 2D spatial grid to evaluate a 2,048 x 2,048 face site TIN accurately and quickly", () => {
+    const grid = (name: string, role: SurfaceRole, n: number, z: number): GradingSurface => {
+      const points: TinVertex[] = [];
+      for (let y = 0; y <= n; y++) {
+        for (let x = 0; x <= n; x++) {
+          points.push({ id: `${x}_${y}`, easting: length("ft", x * 10), northing: length("ft", y * 10), elevation: length("ft", z) });
+        }
+      }
+      const faces: TinFace[] = [];
+      const stride = n + 1;
+      for (let y = 0; y < n; y++) {
+        for (let x = 0; x < n; x++) {
+          const i0 = y * stride + x;
+          const i1 = i0 + 1;
+          const i2 = i0 + stride + 1;
+          const i3 = i0 + stride;
+          faces.push({ a: i0, b: i1, c: i2 }, { a: i0, b: i2, c: i3 });
+        }
+      }
+      return { id: `gs-${name}`, name, role, linearUnit: "ft", sourceLinearUnit: "foot", points, faces };
+    };
+    const existing = grid("ex", "existing", 32, 100);
+    const proposed = grid("pr", "proposed", 32, 101);
+    const t0 = performance.now();
+    const result = cutFillBetween(existing, proposed);
+    const elapsedMs = performance.now() - t0;
+    expect(to(result.fill, "ft3")).toBeCloseTo(320 * 320, 2);
+    expect(to(result.cut, "ft3")).toBeCloseTo(0, 6);
+    expect(elapsedMs).toBeLessThan(500);
   });
 });

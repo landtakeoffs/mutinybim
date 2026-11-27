@@ -44,6 +44,10 @@ interface Tri {
   readonly a: MeshPoint;
   readonly b: MeshPoint;
   readonly c: MeshPoint;
+  readonly minX: number;
+  readonly minY: number;
+  readonly maxX: number;
+  readonly maxY: number;
 }
 
 interface Totals {
@@ -95,9 +99,19 @@ function triArea(a: PlanPoint, b: PlanPoint, c: PlanPoint): number {
   return Math.abs((b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y)) * 0.5;
 }
 
-function orient(t: Tri): Tri {
-  const signed = (t.b.x - t.a.x) * (t.c.y - t.a.y) - (t.c.x - t.a.x) * (t.b.y - t.a.y);
-  return signed < 0 ? { a: t.a, b: t.c, c: t.b } : t;
+function makeTri(a: MeshPoint, b: MeshPoint, c: MeshPoint): Tri {
+  const signed = (b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y);
+  const p = signed < 0 ? c : b;
+  const q = signed < 0 ? b : c;
+  return {
+    a,
+    b: p,
+    c: q,
+    minX: Math.min(a.x, p.x, q.x),
+    minY: Math.min(a.y, p.y, q.y),
+    maxX: Math.max(a.x, p.x, q.x),
+    maxY: Math.max(a.y, p.y, q.y),
+  };
 }
 
 function elevationAt(p: PlanPoint, t: Tri): number {
@@ -240,7 +254,7 @@ function trianglesOf(points: readonly MeshPoint[], faces: readonly TinFace[], na
       continue;
     }
     area += areaM2;
-    tris.push(orient({ a, b, c }));
+    tris.push(makeTri(a, b, c));
   }
   if (bad > 0) issues.push(`${name} has ${bad} ${bad === 1 ? "triangle that names" : "triangles that name"} a missing point. ${bad === 1 ? "It was" : "They were"} left out.`);
   if (skipped > 0) issues.push(`${name} has ${skipped} ${skipped === 1 ? "triangle" : "triangles"} with no plan area (vertical, or a repeated corner). ${skipped === 1 ? "It adds" : "They add"} no volume.`);
@@ -253,6 +267,56 @@ function volume(m3: number): Quantity<"volume"> {
 
 function area(m2: number): Quantity<"area"> {
   return qty("area", m2, "m2");
+}
+
+/** 2D uniform grid over the overlap bounding box so `cutFillBetween` skips non-overlapping triangle pairs in O(1). */
+function buildTriGrid(tris: readonly Tri[], minX: number, minY: number, maxX: number, maxY: number, lenEps: number): {
+  readonly cols: number;
+  readonly rows: number;
+  readonly invW: number;
+  readonly invH: number;
+  readonly originX: number;
+  readonly originY: number;
+  readonly buckets: readonly (readonly number[])[];
+} {
+  const width = Math.max(maxX - minX, 1e-6);
+  const height = Math.max(maxY - minY, 1e-6);
+  const target = Math.min(64, Math.max(1, Math.round(Math.sqrt(tris.length))));
+  const aspect = Math.sqrt(width / height);
+  const cols = Math.min(64, Math.max(1, Math.round(target * aspect)));
+  const rows = Math.min(64, Math.max(1, Math.round(target / aspect)));
+  const invW = cols / width;
+  const invH = rows / height;
+  const buckets: number[][] = Array.from({ length: cols * rows }, () => []);
+  const clampCol = (x: number) => Math.max(0, Math.min(cols - 1, Math.floor((x - minX) * invW)));
+  const clampRow = (y: number) => Math.max(0, Math.min(rows - 1, Math.floor((y - minY) * invH)));
+  for (let idx = 0; idx < tris.length; idx++) {
+    const t = tris[idx]!;
+    if (t.maxX < minX - lenEps || t.minX > maxX + lenEps || t.maxY < minY - lenEps || t.minY > maxY + lenEps) continue;
+    const c0 = clampCol(t.minX - lenEps);
+    const c1 = clampCol(t.maxX + lenEps);
+    const r0 = clampRow(t.minY - lenEps);
+    const r1 = clampRow(t.maxY + lenEps);
+    for (let r = r0; r <= r1; r++) {
+      const rowOff = r * cols;
+      for (let c = c0; c <= c1; c++) buckets[rowOff + c]!.push(idx);
+    }
+  }
+  return { cols, rows, invW, invH, originX: minX, originY: minY, buckets };
+}
+
+function bboxOf(tris: readonly Tri[]): { readonly minX: number; readonly minY: number; readonly maxX: number; readonly maxY: number } {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const t of tris) {
+    if (t.minX < minX) minX = t.minX;
+    if (t.minY < minY) minY = t.minY;
+    if (t.maxX > maxX) maxX = t.maxX;
+    if (t.maxY > maxY) maxY = t.maxY;
+  }
+  return { minX, minY, maxX, maxY };
 }
 
 /**
@@ -273,16 +337,50 @@ export function cutFillBetween(existing: GradingSurface, proposed: GradingSurfac
     const span = spanOf([...exPts, ...prPts]);
     const lenEps = span * 1e-10;
     const sideEps = lenEps * span;
-    for (const a of ex.tris) {
-      for (const b of pr.tris) {
-        const poly = clipTriangle(a, b, sideEps, lenEps);
-        if (poly.length < 3) continue;
-        for (let i = 1; i < poly.length - 1; i++) {
-          const p = poly[0]!;
-          const q = poly[i]!;
-          const r = poly[i + 1]!;
-          const dz = (at: PlanPoint): number => elevationAt(at, b) - elevationAt(at, a);
-          addVolume(p, q, r, dz(p), dz(q), dz(r), totals);
+    const exBox = bboxOf(ex.tris);
+    const prBox = bboxOf(pr.tris);
+    const ovMinX = Math.max(exBox.minX, prBox.minX);
+    const ovMinY = Math.max(exBox.minY, prBox.minY);
+    const ovMaxX = Math.min(exBox.maxX, prBox.maxX);
+    const ovMaxY = Math.min(exBox.maxY, prBox.maxY);
+    if (ovMaxX >= ovMinX - lenEps && ovMaxY >= ovMinY - lenEps) {
+      const grid = buildTriGrid(pr.tris, ovMinX, ovMinY, ovMaxX, ovMaxY, lenEps);
+      const seen = new Uint32Array(pr.tris.length);
+      let stamp = 0;
+      const clampCol = (x: number) => Math.max(0, Math.min(grid.cols - 1, Math.floor((x - grid.originX) * grid.invW)));
+      const clampRow = (y: number) => Math.max(0, Math.min(grid.rows - 1, Math.floor((y - grid.originY) * grid.invH)));
+      for (const a of ex.tris) {
+        if (a.maxX < ovMinX - lenEps || a.minX > ovMaxX + lenEps || a.maxY < ovMinY - lenEps || a.minY > ovMaxY + lenEps) continue;
+        stamp += 1;
+        if (stamp === 0) {
+          seen.fill(0);
+          stamp = 1;
+        }
+        const c0 = clampCol(a.minX - lenEps);
+        const c1 = clampCol(a.maxX + lenEps);
+        const r0 = clampRow(a.minY - lenEps);
+        const r1 = clampRow(a.maxY + lenEps);
+        for (let r = r0; r <= r1; r++) {
+          const rowOff = r * grid.cols;
+          for (let c = c0; c <= c1; c++) {
+            const bucket = grid.buckets[rowOff + c]!;
+            for (let k = 0; k < bucket.length; k++) {
+              const bIdx = bucket[k]!;
+              if (seen[bIdx] === stamp) continue;
+              seen[bIdx] = stamp;
+              const b = pr.tris[bIdx]!;
+              if (a.maxX < b.minX - lenEps || b.maxX < a.minX - lenEps || a.maxY < b.minY - lenEps || b.maxY < a.minY - lenEps) continue;
+              const poly = clipTriangle(a, b, sideEps, lenEps);
+              if (poly.length < 3) continue;
+              for (let i = 1; i < poly.length - 1; i++) {
+                const p = poly[0]!;
+                const q = poly[i]!;
+                const rPt = poly[i + 1]!;
+                const dz = (at: PlanPoint): number => elevationAt(at, b) - elevationAt(at, a);
+                addVolume(p, q, rPt, dz(p), dz(q), dz(rPt), totals);
+              }
+            }
+          }
         }
       }
     }
