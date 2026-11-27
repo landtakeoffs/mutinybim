@@ -1,6 +1,6 @@
 import fontkit from "@pdf-lib/fontkit";
-import { PDFDocument, StandardFonts, degrees, rgb, type PDFFont, type RGB } from "pdf-lib";
-import { TONE_GREY, fillGrey, lineWidthMm, organizationOf, type ModelState, type SheetScene, type Tone } from "@permitzip/bim-kernel";
+import { LineCapStyle, PDFArray, PDFDocument, PDFName, PDFString, StandardFonts, degrees, rgb, type PDFFont, type RGB } from "pdf-lib";
+import { TONE_GREY, fillGrey, lineWidthMm, organizationOf, smoothStrokeSvgPath, type ModelState, type SheetScene, type Tone } from "@permitzip/bim-kernel";
 import { drawTextBlocks } from "./text/pdf-text";
 import { WinAnsiWriter } from "./text/win-ansi";
 import type { NoteFontSource } from "./text/fonts";
@@ -112,6 +112,39 @@ export async function renderSheetPdfWith(scene: SheetScene, meta: PdfMetadata, d
   const page = doc.addPage([width, height]);
   const regular = await doc.embedFont(StandardFonts.Helvetica);
   const bold = await doc.embedFont(StandardFonts.HelveticaBold);
+  // Lazily embed additional standard PDF faces only when a Text Type requests Courier, Times, or italic — keeping default PDFs byte-identical.
+  const extraFonts = new Map<StandardFonts, PDFFont>();
+  const standardFontFor = async (fontFamily?: string, isBold?: boolean, isItalic?: boolean): Promise<PDFFont> => {
+    const fam = fontFamily?.toLowerCase() ?? "";
+    const isMono = fam.includes("courier") || fam.includes("mono");
+    const isSerif = !isMono && (fam.includes("times") || fam.includes("serif") || fam.includes("georgia"));
+    if (!isMono && !isSerif && !isItalic) return isBold ? bold : regular;
+    const key: StandardFonts = isMono
+      ? isBold && isItalic
+        ? StandardFonts.CourierBoldOblique
+        : isBold
+          ? StandardFonts.CourierBold
+          : isItalic
+            ? StandardFonts.CourierOblique
+            : StandardFonts.Courier
+      : isSerif
+        ? isBold && isItalic
+          ? StandardFonts.TimesRomanBoldItalic
+          : isBold
+            ? StandardFonts.TimesRomanBold
+            : isItalic
+              ? StandardFonts.TimesRomanItalic
+              : StandardFonts.TimesRoman
+        : isBold
+          ? StandardFonts.HelveticaBoldOblique
+          : StandardFonts.HelveticaOblique;
+    let cached = extraFonts.get(key);
+    if (!cached) {
+      cached = await doc.embedFont(key);
+      extraFonts.set(key, cached);
+    }
+    return cached;
+  };
   const winAnsi = new WinAnsiWriter();
   const black = rgb(0, 0, 0);
   const toneColor = (tone: Tone | undefined, color?: string) => (tone && tone !== "ink" ? rgb(TONE_GREY[tone], TONE_GREY[tone], TONE_GREY[tone]) : color && !print.monochrome ? hexColor(color) : black);
@@ -153,6 +186,39 @@ export async function renderSheetPdfWith(scene: SheetScene, meta: PdfMetadata, d
     page.drawImage(embedded, { x: x(im.at.x), y: y(im.at.y + im.size.y), width: im.size.x * MM_TO_PT, height: im.size.y * MM_TO_PT });
   }
 
+  const drawStroke = (p: Extract<SheetScene["primitives"][number], { kind: "stroke" }>) => {
+    const strokeColor = p.preserveColor ? hexColor(p.color ?? "#dc2626") : toneColor(undefined, p.color);
+    const opacity = p.opacity ?? 1;
+    if (p.points.length === 1) {
+      const q = p.points[0];
+      if (q) {
+        page.drawCircle({
+          x: x(q.x),
+          y: y(q.y),
+          size: (p.widthMm / 2) * MM_TO_PT,
+          color: strokeColor,
+          opacity,
+          borderWidth: 0,
+        });
+      }
+    } else {
+      const ptPoints = p.points.map((q) => ({ x: q.x * MM_TO_PT, y: q.y * MM_TO_PT }));
+      const path = p.sharp
+        ? `M${ptPoints.map((q) => `${q.x.toFixed(3)} ${q.y.toFixed(3)}`).join(" L")}${p.closed ? " Z" : ""}`
+        : smoothStrokeSvgPath(ptPoints, p.closed);
+      if (path) {
+        page.drawSvgPath(path, {
+          x: 0,
+          y: height,
+          borderColor: strokeColor,
+          borderWidth: p.widthMm * MM_TO_PT,
+          borderOpacity: opacity,
+          borderLineCap: LineCapStyle.Round,
+        });
+      }
+    }
+  };
+  const overlayStrokes: Array<Extract<SheetScene["primitives"][number], { kind: "stroke" }>> = [];
   for (const p of scene.primitives) {
     if (p.kind === "line") {
       page.drawLine({
@@ -177,18 +243,90 @@ export async function renderSheetPdfWith(scene: SheetScene, meta: PdfMetadata, d
         borderColor: toneColor(undefined, p.color),
         borderWidth: lineWidthMm(p) * MM_TO_PT,
       });
+    } else if (p.kind === "circle") {
+      page.drawCircle({
+        x: x(p.at.x),
+        y: y(p.at.y),
+        size: p.r * MM_TO_PT,
+        borderColor: toneColor(p.tone, p.color),
+        borderWidth: lineWidthMm(p) * MM_TO_PT,
+        ...(p.dash ? { borderDashArray: p.dash.map((d) => d * MM_TO_PT) } : {}),
+      });
+    } else if (p.kind === "stroke") {
+      if (p.markupId) overlayStrokes.push(p);
+      else drawStroke(p);
     } else {
       const face = p.font ? sceneFonts.get(p.font) : undefined;
-      const font: PDFFont = face?.font ?? (p.bold ? bold : regular);
+      const font: PDFFont = face?.font ?? (await standardFontFor(p.fontFamily, p.bold, p.italic));
       const size = (p.size / (face?.capHeight ?? CAP_HEIGHT_RATIO)) * MM_TO_PT;
       const text = face ? p.text : winAnsi.text(font, p.text);
       const textWidth = font.widthOfTextAtSize(text, size);
       const dx = p.anchor === "middle" ? -textWidth / 2 : p.anchor === "end" ? -textWidth : 0;
+      const safeHref = p.href && /^https?:\/\//i.test(p.href.trim()) ? p.href.trim() : null;
+      const capPt = p.size * MM_TO_PT;
+      const descPt = capPt * 0.24;
+      // Match SVG vAlign="middle": shift baseline down by 0.35 * cap height so centered inline codes align identically in PDF and SVG.
+      const vShiftMm = p.vAlign === "middle" ? p.size * 0.35 : 0;
+      const ox = x(p.at.x);
+      const oy = y(p.at.y);
+      const baselineOy = y(p.at.y + vShiftMm);
+      if (p.mask && text.length > 0) {
+        const padX = Math.max(0.45, p.size * 0.22) * MM_TO_PT;
+        const padY = Math.max(0.32, p.size * 0.16) * MM_TO_PT;
+        const bx0 = dx - padX;
+        const bx1 = dx + textWidth + padX;
+        const halfH = (capPt * 1.24) / 2 + padY;
+        const by0 = p.vAlign === "middle" ? -halfH : -descPt - padY;
+        const by1 = p.vAlign === "middle" ? halfH : capPt + padY;
+        const rad = p.rotate ? (-p.rotate * Math.PI) / 180 : 0;
+        const c = Math.cos(rad);
+        const s = Math.sin(rad);
+        const corner = (lx: number, ly: number) => ({ px: ox + lx * c - ly * s, py: oy + lx * s + ly * c });
+        const pts = [corner(bx0, by0), corner(bx1, by0), corner(bx1, by1), corner(bx0, by1)];
+        const maskPath = pts.map((q, i) => `${i === 0 ? "M" : "L"}${q.px.toFixed(3)} ${(height - q.py).toFixed(3)}`).join(" ") + " Z";
+        page.drawSvgPath(maskPath, { x: 0, y: height, color: rgb(1, 1, 1), borderWidth: 0 });
+      }
+      const textColor = safeHref && !print.monochrome ? hexColor("#1d4ed8") : toneColor(p.tone, p.color);
       if (p.rotate) {
         // Paper turns clockwise with y down; PDF turns counter-clockwise with y up. The anchor shift turns with the words.
         const a = (-p.rotate * Math.PI) / 180;
-        page.drawText(text, { x: x(p.at.x) + dx * Math.cos(a), y: y(p.at.y) + dx * Math.sin(a), size, font, color: toneColor(p.tone, p.color), rotate: degrees(-p.rotate) });
-      } else page.drawText(text, { x: x(p.at.x) + dx, y: y(p.at.y), size, font, color: toneColor(p.tone, p.color) });
+        const localY = -vShiftMm * MM_TO_PT;
+        page.drawText(text, {
+          x: ox + dx * Math.cos(a) - localY * Math.sin(a),
+          y: oy + dx * Math.sin(a) + localY * Math.cos(a),
+          size,
+          font,
+          color: textColor,
+          rotate: degrees(-p.rotate),
+        });
+      } else {
+        page.drawText(text, { x: ox + dx, y: baselineOy, size, font, color: textColor });
+        if (safeHref && textWidth > 0) {
+          // Draw subtle link underline + attach a standard PDF URI Link annotation covering the text bounds.
+          page.drawLine({
+            start: { x: ox + dx, y: baselineOy - descPt * 0.45 },
+            end: { x: ox + dx + textWidth, y: baselineOy - descPt * 0.45 },
+            thickness: Math.max(0.35, capPt * 0.06),
+            color: textColor,
+          });
+          const linkAnnot = doc.context.register(
+            doc.context.obj({
+              Type: "Annot",
+              Subtype: "Link",
+              Rect: [ox + dx, baselineOy - descPt, ox + dx + textWidth, baselineOy + capPt],
+              Border: [0, 0, 0],
+              A: {
+                Type: "Action",
+                S: "URI",
+                URI: PDFString.of(safeHref),
+              },
+            }),
+          );
+          const existingAnnots = page.node.lookup(PDFName.of("Annots"), PDFArray);
+          if (existingAnnots) existingAnnots.push(linkAnnot);
+          else page.node.set(PDFName.of("Annots"), doc.context.obj([linkAnnot]));
+        }
+      }
     }
   }
 
@@ -197,6 +335,8 @@ export async function renderSheetPdfWith(scene: SheetScene, meta: PdfMetadata, d
     if (!noteFonts) throw new Error("This sheet has notes, and their fonts weren't provided, so it can't be printed here");
     await drawTextBlocks(doc, page, blocks, noteFonts);
   }
+  // Review markup strokes paint after text blocks so masked rich-text notes never obscure review ink.
+  for (const s of overlayStrokes) drawStroke(s);
 
   return { bytes: await doc.save({ useObjectStreams: false }), embeddedDetails, substitutedText: winAnsi.substituted };
 }

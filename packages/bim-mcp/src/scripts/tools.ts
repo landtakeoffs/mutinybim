@@ -1,9 +1,12 @@
 import { createHash } from "node:crypto";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { DEFAULT_SETTINGS, canonicalJson, elementCount, elementValues, gatedRecordFeatures, type ModelState } from "@permitzip/bim-kernel";
+import { DEFAULT_SETTINGS, canonicalJson, elementCount, elementValues, executeCommand, gatedRecordFeatures, withUpgradePolicy, type ModelState } from "@permitzip/bim-kernel";
 import { contentHashOf, makeItem, scriptItemSchema, scriptReadsSchema, type ScriptItem, type ScriptReads } from "@permitzip/bim-library";
 import {
+  CLASH_DETAIL_LEVELS,
+  CLASH_SCOPES,
+  CLASH_TYPES,
   RUNNER_CONTRACT,
   SLICE_FORMAT,
   ScriptOutputError,
@@ -14,17 +17,21 @@ import {
   checkScriptOutput,
   checkScriptSource,
   commandFields,
+  evaluateClashReport,
   kitUseWarnings,
   lintScript,
   parseScriptOutput,
   partTypeItemsFromRun,
   readsWarnings,
   runFailureWords,
+  searchCommands,
   searchReference,
   sliceAsModel,
   sliceModel,
+  type ClashReport,
   type ModelSlice,
   type OutputCheck,
+  type RawClashReportOptions,
   type ScriptOutput,
   type ScriptRunResult,
 } from "@permitzip/bim-script";
@@ -32,7 +39,7 @@ import { PROTOCOL_FEATURES } from "@permitzip/bim-sync";
 import { CHANGING_TOOL, READ_ONLY_TOOL } from "../annotations";
 import type { ApprovalIo, ApprovalProposal } from "../approvals";
 import { libraryPartTypesFor } from "./library-parts";
-import type { LibrarySaveResult, ModelArgs, ScriptLibrary, ScriptToolHost, ToolResult } from "../host";
+import type { LibrarySaveResult, ModelArgs, ScriptLibrary, ScriptRenderedImage, ScriptToolHost, ToolResult } from "../host";
 import { PROJECT_SCHEMAS, type CoreSchemas } from "../schemas";
 import { editsChange, outputHash, partTypesChange, type ScriptChangeReport } from "./change-summary";
 import { KEPT_SCRIPT_KEEP_MS, SCRIPT_EXPIRED_WORDS, applyReplacements, keepScript, notePreview, previewOf, readKeptScript, type KeptPreview, type KeptScript, type ScriptPreviewStore } from "./previews";
@@ -350,18 +357,75 @@ interface Checked {
   readonly check: OutputCheck;
   readonly change: ScriptChangeReport;
   readonly hash: string;
+  readonly clashes?: ClashReport;
+}
+
+const DEFAULT_RUN_CLASH_TYPES = ["hard", "self", "clearance", "dedicated_space", "ceiling"] as const;
+
+type RunClashesInput =
+  | boolean
+  | {
+      readonly enabled?: boolean;
+      readonly scope?: (typeof CLASH_SCOPES)[number];
+      readonly ruleset?: "default" | "coordination" | "documents" | "issue";
+      readonly types?: readonly (typeof CLASH_TYPES)[number][];
+      readonly min_severity?: "error" | "warning" | "info";
+      readonly detail?: (typeof CLASH_DETAIL_LEVELS)[number];
+      readonly level?: string;
+      readonly tolerance_in?: number;
+      readonly soft_clearance_in?: number;
+      readonly structure_clearance_in?: number;
+      readonly max_findings?: number;
+      readonly skip_rules?: readonly string[];
+    };
+
+function resolveRunClashOptions(raw: RunClashesInput | undefined, defaultLevel?: string): RawClashReportOptions | null {
+  if (!raw) return null;
+  if (raw === true) {
+    return {
+      scope: "touched",
+      ruleset: "coordination",
+      types: DEFAULT_RUN_CLASH_TYPES,
+      detail: "compact",
+      ...(defaultLevel ? { level: defaultLevel } : {}),
+    };
+  }
+  if (raw.enabled === false) return null;
+  return {
+    scope: raw.scope ?? "touched",
+    ruleset: raw.ruleset ?? "coordination",
+    ...(raw.types ? { types: raw.types } : {}),
+    ...(raw.min_severity ? { minSeverity: raw.min_severity } : {}),
+    detail: raw.detail ?? "compact",
+    ...(raw.level ?? defaultLevel ? { level: raw.level ?? defaultLevel } : {}),
+    ...(raw.tolerance_in !== undefined ? { toleranceIn: raw.tolerance_in } : {}),
+    ...(raw.soft_clearance_in !== undefined ? { softClearanceIn: raw.soft_clearance_in } : {}),
+    ...(raw.structure_clearance_in !== undefined ? { structureClearanceIn: raw.structure_clearance_in } : {}),
+    ...(raw.max_findings !== undefined ? { maxFindings: raw.max_findings } : {}),
+    ...(raw.skip_rules ? { skipRules: raw.skip_rules } : {}),
+  };
 }
 
 /** The run's output, checked and summarised; a refusal in words when it doesn't check out. */
-async function checked(helpers: ScriptToolHost, run: RunOnModel): Promise<Checked | { readonly stopped: Extract<ScriptRunResult, { ok: false }> } | { readonly refused: string }> {
+async function checked(helpers: ScriptToolHost, run: RunOnModel, clashOptions?: RawClashReportOptions | null): Promise<Checked | { readonly stopped: Extract<ScriptRunResult, { ok: false }> } | { readonly refused: string }> {
   if (!run.result.ok) return { stopped: run.result };
   const output = parseScriptOutput(run.result.output);
   if (output.kind === "part_types") await drawingEngine(helpers);
-  const check = checkScriptOutput(run.head, output, { features: run.slice.features });
+  let clashes: ClashReport | undefined;
+  const check = checkScriptOutput(run.head, output, {
+    features: run.slice.features,
+    ...(clashOptions
+      ? {
+          onAfterEdits: (after, touchedIds) => {
+            clashes = evaluateClashReport(after, clashOptions, touchedIds);
+          },
+        }
+      : {}),
+  });
   if (output.kind === "part_types") return { output, check, change: partTypesChange(output), hash: outputHash(output) };
   const change = editsChange(run.head, output, run.slice);
   if ("refused" in change) return { refused: change.refused };
-  return { output, check, change, hash: outputHash(output) };
+  return { output, check, change, hash: outputHash(output), ...(clashes ? { clashes } : {}) };
 }
 
 /** Loads the part geometry engine for pictures; without it the checks still run and say there is no picture. */
@@ -568,7 +632,7 @@ const referenceIndex = (keepsScripts: boolean) => ({
     : {}),
   read_more: 'search: a topic (the two best matches whole, the rest by name). topic: one function or recipe by its exact name, whole with its example. command: one ctx.edit command\'s fields. example: one whole script.',
   prefer: "One script for a multi-step layout (connect N parts to a run, place and route equipment, a sheet per level) instead of many single tool calls: one preview, one Approve, one Undo.",
-  module: 'import { defineScript, units, routes, parts, building, equipment, documents, checks } from "@permitzip/bim-script"; export default defineScript({ kind: "part" | "layout" | "route", reads, parameters, run(ctx, values) { ... } }). Import nothing else; no fetch, files, timers, Date or Math.random.',
+  module: 'import { defineScript, units, routes, parts, building, equipment, documents, markups, drafting, checks, electrical } from "@permitzip/bim-script"; export default defineScript({ kind: "part" | "layout" | "route", reads, parameters, run(ctx, values) { ... } }). Import nothing else; no fetch, files, timers, Date or Math.random.',
   kit: kitByNamespace(),
   /** The jobs an engineer names, each with a worked example: read one with topic (topic: "Schedules") for its steps and script. */
   tasks: Object.fromEntries(KIT_RECIPES.map((r) => [r.task, r.name])),
@@ -638,14 +702,39 @@ export function registerBimScriptTools(server: McpServer, helpers: ScriptToolHel
       try {
         if (args.example) {
           const x = kitExample(args.example);
-          if (!x) return failure(`No example "${args.example}". Examples: ${KIT_EXAMPLES.map((e) => e.name).join(", ")}.`);
+          if (!x) {
+            const examples = KIT_EXAMPLES.map((e) => e.name);
+            return json({
+              found: false,
+              example: args.example,
+              message: `No example "${args.example}". Examples: ${examples.join(", ")}.`,
+              examples,
+            });
+          }
           return json({ example: x.name, title: x.title, builds: x.builds, run: "Send source as script.source to bim_run_script with the reads it declares; check, then apply.", source: x.source });
         }
         if (args.command) {
           const found = commandFields(args.command);
           if (!found) {
-            const near = searchReference(args.command.replace(/_/g, " "), 6).filter((h) => h.kind === "command").map((h) => h.name);
-            return failure(`ctx.edit has no command "${args.command}".${near.length ? ` Near: ${near.join(", ")}.` : ""} Search with bim_script_reference({ search }).`);
+            const query = args.command.replace(/_/g, " ");
+            const nearCommands = searchCommands(query, 6).map((c) => c.type);
+            const nearTopics = searchReference(query, 6)
+              .filter((h) => h.kind === "function" || h.kind === "recipe")
+              .slice(0, 4)
+              .map((h) => h.name);
+            const hints = [
+              nearCommands.length ? `Near commands: ${nearCommands.join(", ")}.` : "",
+              nearTopics.length ? `Related kit functions/recipes: ${nearTopics.join(", ")}.` : "",
+            ]
+              .filter(Boolean)
+              .join(" ");
+            return json({
+              found: false,
+              command: args.command,
+              message: `ctx.edit has no command "${args.command}".${hints ? ` ${hints}` : ""} Search with bim_script_reference({ search }).`,
+              ...(nearCommands.length ? { near_commands: nearCommands } : {}),
+              ...(nearTopics.length ? { near_topics: nearTopics } : {}),
+            });
           }
           // The one-line fields say everything for most commands; the full schema rides along only when a line had to cut a nested shape short.
           const cut = found.fields.some((f) => f.includes("{…}") || /: unknown\b/.test(f));
@@ -655,7 +744,12 @@ export function registerBimScriptTools(server: McpServer, helpers: ScriptToolHel
           const found = referenceTopic(args.topic);
           if (!found) {
             const near = searchReference(args.topic, 5).map((h) => h.name);
-            return failure(`No function or recipe named "${args.topic}".${near.length ? ` Near: ${near.join(", ")}.` : ""} Search with bim_script_reference({ search }).`);
+            return json({
+              found: false,
+              topic: args.topic,
+              message: `No function or recipe named "${args.topic}".${near.length ? ` Near: ${near.join(", ")}.` : ""} Search with bim_script_reference({ search }).`,
+              ...(near.length ? { near } : {}),
+            });
           }
           return json(found);
         }
@@ -738,13 +832,35 @@ export function registerBimScriptTools(server: McpServer, helpers: ScriptToolHel
     },
   );
 
+  const clashesObjectSchema = z
+    .object({
+      enabled: z.boolean().optional(),
+      scope: z.enum(CLASH_SCOPES).optional(),
+      ruleset: z.enum(["default", "coordination", "documents", "issue"]).optional(),
+      types: z.array(z.enum(CLASH_TYPES)).max(8).optional(),
+      min_severity: z.enum(["error", "warning", "info"]).optional(),
+      detail: z.enum(CLASH_DETAIL_LEVELS).optional(),
+      level: z.string().min(1).max(80).optional(),
+      tolerance_in: z.number().min(0).max(12).optional(),
+      soft_clearance_in: z.number().min(0).max(24).optional(),
+      structure_clearance_in: z.number().min(0).max(24).optional(),
+      max_findings: z.number().int().min(1).max(100).optional(),
+      skip_rules: z.array(z.string().min(1).max(60)).max(40).optional(),
+    })
+    .strict();
+
+  const clashesArg = z
+    .union([z.boolean(), z.record(z.string(), z.unknown())])
+    .optional()
+    .describe("Clash report: true or {scope?, types?, min_severity?, detail?, level?, tolerance_in?, max_findings?}.");
+
   server.registerTool(
     "bim_run_script",
     {
       title: "Run a script (preview)",
       annotations: READ_ONLY_TOOL,
-      description: `Preview: run a script ${options.runsWhere ?? SEALED_MACHINE_WORDS} and check its output. Saves nothing; returns what would change, apply_with and script_id (send the id, not the text, next time).`,
-      inputSchema: { project_id: target.project_id, model_id: target.model_id.optional(), ...area, script: scriptArg, values: valuesArg, selection: selectionArg },
+      description: `Preview: run a script ${options.runsWhere ?? SEALED_MACHINE_WORDS} and check its output. Saves nothing; returns changes, optional clashes, apply_with and script_id.`,
+      inputSchema: { project_id: target.project_id, model_id: target.model_id.optional(), ...area, script: scriptArg, values: valuesArg, selection: selectionArg, clashes: clashesArg },
     },
     async (args, extra) => {
       try {
@@ -765,7 +881,18 @@ export function registerBimScriptTools(server: McpServer, helpers: ScriptToolHel
           repeated = before !== undefined;
           return before ?? null;
         });
-        const got = await checked(helpers, run);
+        let parsedClashes: RunClashesInput | undefined;
+        if (typeof args.clashes === "boolean") {
+          parsedClashes = args.clashes;
+        } else if (args.clashes !== undefined) {
+          const parsed = clashesObjectSchema.safeParse(args.clashes);
+          if (!parsed.success) {
+            return json({ status: "refused", message: `Invalid clashes config: ${parsed.error.issues.map((i) => `${i.path.join(".") || "clashes"}: ${i.message}`).join("; ")}`, nothing_changed: true });
+          }
+          parsedClashes = parsed.data;
+        }
+        const clashOptions = resolveRunClashOptions(parsedClashes, args.level);
+        const got = await checked(helpers, run, clashOptions);
         if ("stopped" in got) {
           if (got.stopped.code.startsWith("cap_") && !repeated) {
             stopped.set(stoppedKey(resolved.script.seed, values, run.slice.revision), got.stopped);
@@ -782,8 +909,72 @@ export function registerBimScriptTools(server: McpServer, helpers: ScriptToolHel
           return json({ status: "has_issues", message: `The script declares reads ${canonicalJson(manifest.reads)} but was run with ${canonicalJson(resolved.script.reads)}. ${how}`, ...(declared ? { script_id: declared.id } : {}), nothing_changed: true });
         }
         const report = got.output.report ? { report: got.output.report } : {};
+        const renderRequests = got.output.renders ?? [];
+        let renderedImages: readonly ScriptRenderedImage[] = [];
+        let renderNote: string | undefined;
+        if (renderRequests.length > 0 && args.model_id) {
+          if (helpers.renderImages) {
+            try {
+              // Replay from `run.head` (the exact validated snapshot) under `run.slice.features`
+              // so rendered previews match reports/checks and honor feature-gated commands (e.g. markups).
+              const featureSet = new Set(run.slice.features);
+              const targetModel = withUpgradePolicy((f) => featureSet.has(f), () => {
+                let m = run.head;
+                if (got.output.kind === "edits" && got.output.steps > 0) {
+                  const at = new Date().toISOString();
+                  for (const batch of got.output.batches) {
+                    const res = executeCommand(m, batch, { actorId: "script-preview", at });
+                    if (!res.ok) {
+                      throw new Error(`Preview replay refused: ${res.error.message}`);
+                    }
+                    m = res.model;
+                  }
+                }
+                return m;
+              });
+              renderedImages = await helpers.renderImages(extra, { project_id: args.project_id, model_id: args.model_id }, targetModel, renderRequests);
+            } catch (err) {
+              renderNote = `Sheet/view image rendering failed: ${err instanceof Error ? err.message : String(err)}`;
+            }
+          } else {
+            renderNote = "This host has no image renderer configured for ctx.render requests.";
+          }
+        }
+        const withImages = (payload: Record<string, unknown>): ToolResult => {
+          const extraMeta: Record<string, unknown> = {
+            ...(renderedImages.length > 0
+              ? {
+                  rendered_images: renderedImages.map((im, i) => ({
+                    index: i + 1,
+                    label: im.label,
+                    kind: im.kind,
+                    target_id: im.targetId,
+                    target_name: im.targetName,
+                    revision: im.revision,
+                    width_px: im.widthPx,
+                    height_px: im.heightPx,
+                    dpi: im.dpi,
+                    region_mm: im.regionMm,
+                  })),
+                }
+              : {}),
+            ...(renderNote ? { render_note: renderNote } : {}),
+          };
+          const full = { ...payload, ...extraMeta };
+          if (renderedImages.length === 0) return json(full);
+          return {
+            content: [
+              { type: "text", text: JSON.stringify(full, null, 2) },
+              ...renderedImages.map((im) => ({ type: "image" as const, data: im.png.toString("base64"), mimeType: "image/png" })),
+            ],
+          };
+        };
         if (got.output.kind === "edits" && got.output.steps === 0) {
-          return json({ status: "reported", kind: "edits", ...report, message: "The script made no edits, so there is nothing to apply. Its reports are in report.", ...idPart(sid, false), nothing_changed: true, ms: run.result.ok ? run.result.ms : 0 });
+          const msg =
+            renderedImages.length > 0
+              ? `Rendered ${renderedImages.length} image${renderedImages.length === 1 ? "" : "s"} (attached below). The script made no edits, so there is nothing to apply.`
+              : "The script made no edits, so there is nothing to apply. Its reports are in report.";
+          return withImages({ status: "reported", kind: "edits", ...report, message: msg, ...idPart(sid, false), nothing_changed: true, ms: run.result.ok ? run.result.ms : 0 });
         }
         const tier = got.change.tier;
         const approval = tier.tier;
@@ -798,6 +989,7 @@ export function registerBimScriptTools(server: McpServer, helpers: ScriptToolHel
             steps: got.output.steps,
             changes: { creates: got.change.summary.creates, edits: got.change.summary.edits, deletes: got.change.summary.deletes },
             checks: checkLines(got.check),
+            ...(got.clashes ? { clashes: got.clashes } : {}),
             ...report,
             approval,
             ...(tier.tier === "ask_every_time" ? { approval_reasons: tier.reasons } : {}),
@@ -805,11 +997,11 @@ export function registerBimScriptTools(server: McpServer, helpers: ScriptToolHel
             ...idPart(sid, status !== "previewed"),
             ms: run.result.ok ? run.result.ms : 0,
           };
-          if (body.status !== "previewed" || !args.model_id) return json(body);
+          if (body.status !== "previewed" || !args.model_id) return withImages(body);
           // Kept by id: the approved call names the id, and runs with what this preview ran with. Otherwise it carries the script itself.
           const byId = await notePreviewQuietly(store, kept, ran);
           const script = byId && kept ? { script: { id: kept.id } } : { script: scriptEcho(resolved.script), values, ...(args.selection ? { selection: args.selection } : {}) };
-          return json({
+          return withImages({
             ...body,
             apply_with: { tool: SCRIPT_APPLY_TOOL, args: { project_id: args.project_id, model_id: args.model_id, ...(args.level ? { level: args.level } : {}), ...(args.zone ? { zone: args.zone } : {}), base_revision: run.slice.revision, ...script, output_hash: got.hash, label: got.output.label, steps: got.output.steps, changes: body.changes, approval } },
             next: "Show the person what it does. To land it call bim_apply_output with apply_with.args unchanged; nothing changes until they click Approve, and one Undo removes it.",
@@ -985,7 +1177,14 @@ async function libraryAnswer(helpers: ScriptToolHelpers, extra: unknown, action:
     return json({ scripts: rows, ...(rows.length === 0 ? { message: "No scripts yet. Write one (bim_script_reference) and preview it with bim_run_script." } : {}) });
   }
   const item = scripts.find((s) => s.item.key === key && (version === undefined || s.item.version === version))?.item;
-  if (!item) return failure(`No script ${key ?? "(key missing)"}${version ? ` ${version}` : ""}. List them first: bim_script_reference({ library: "list" }).`);
+  if (!item) {
+    return json({
+      found: false,
+      ...(key !== undefined ? { key } : {}),
+      ...(version !== undefined ? { version } : {}),
+      message: `No script ${key ?? "(key missing)"}${version ? ` ${version}` : ""}. List them first: bim_script_reference({ library: "list" }).`,
+    });
+  }
   return json({ key: item.key, version: item.version, name: item.name, manifest: item.manifest, source: item.source, run_with: { key: item.key, version: item.version } });
 }
 

@@ -1,5 +1,6 @@
-import { Check, Circle, Cloud, Eraser, Hexagon, KeyRound, Minus, MoveHorizontal, PaintBucket, Palette, Puzzle, Rainbow, Repeat, Spline, Square, SquareDashed, SquareRoundCorner, Tag, Tags, Type, Waves, Waypoints } from 'lucide-react'
+import { Check, Circle, Cloud, Eraser, FileText, Hexagon, KeyRound, Minus, MoveHorizontal, PaintBucket, Palette, PenTool, Puzzle, Rainbow, Repeat, Spline, Square, SquareDashed, SquareRoundCorner, Tag, Tags, Type, Waves, Waypoints } from 'lucide-react'
 import { DIMENSION_KINDS, detailComponents, type DimensionKind } from '@permitzip/bim-kernel'
+import { STANDARD_NOTE_SETS } from '@permitzip/bim-library'
 import type { RibbonCommand, RibbonGroup, RibbonTab } from './types'
 import type { DrawingTool } from '../views-sheets/DrawingCanvas'
 import type { DraftController } from '../views-sheets/draft/useDraftController'
@@ -14,7 +15,7 @@ import type { BuildingModelRibbonContext } from '../building-model-ribbon'
  */
 
 /** The shapes one Detail line draws; the split button remembers the last one. */
-export const DETAIL_SHAPES = ['line', 'rect', 'polygon', 'arc', 'circle', 'polyline', 'spline'] as const satisfies readonly DrawingTool[]
+export const DETAIL_SHAPES = ['line', 'rect', 'polygon', 'arc', 'arc_radius', 'arc_tangent', 'circle', 'polyline', 'spline'] as const satisfies readonly DrawingTool[]
 export type DetailShape = (typeof DETAIL_SHAPES)[number]
 export function isDetailShape(tool: DrawingTool): tool is DetailShape {
   return (DETAIL_SHAPES as readonly string[]).includes(tool)
@@ -29,17 +30,18 @@ export function drawingReason(ctx: BuildingModelRibbonContext, tool: DrawingTool
   if (tool === 'dimension') return 'Dimensions measure a view. Open a plan, section or detail view, or double-click one on the sheet.'
   if (tool === 'tag') return 'Tags label the model. Open a plan or a section, or double-click one on the sheet.'
   if (tool === 'keynote') return 'Keynotes go on elements in a view. Open a plan or a section, or double-click one on the sheet.'
-  if (tool === 'rect') return 'Rectangles are drawn on sheets and in detail views.'
+  if (tool === 'markup') return 'Marker sketches review markups directly on sheets. Open a sheet (or exit in-place view editing) to redline it.'
   return 'A 3D view or schedule takes no annotation. Draw on the sheet, or in a plan, section or detail view.'
 }
 
-export function drawingCommand(ctx: BuildingModelRibbonContext, tool: DrawingTool, label: string, icon: RibbonCommand['icon'], description: string, keywords: readonly string[]): RibbonCommand {
+export function drawingCommand(ctx: BuildingModelRibbonContext, tool: DrawingTool, label: string, icon: RibbonCommand['icon'], description: string, keywords: readonly string[], shortcut?: string): RibbonCommand {
   return {
     id: `draw-${tool}`,
     label,
     icon,
     description,
     keywords,
+    ...(shortcut ? { shortcut } : {}),
     disabledReason: drawingReason(ctx, tool),
     pressed: ctx.drawingOpen !== null && ctx.drawingTool === tool,
     run: () => ctx.setDrawingTool(tool),
@@ -52,7 +54,9 @@ export function drawingCommand(ctx: BuildingModelRibbonContext, tool: DrawingToo
 const SHAPE: Record<DetailShape, { readonly label: string; readonly icon: RibbonCommand['icon']; readonly description: string; readonly keywords: readonly string[] }> = {
   line: { label: 'Line', icon: Minus, description: 'Drag a detail line; pick its line style in the bar over the drawing', keywords: ['detail line'] },
   rect: { label: 'Rectangle', icon: Square, description: 'Drag a rectangle: four detail lines joined at the corners, so you can fillet, trim or offset them', keywords: ['box', 'joined lines'] },
-  arc: { label: 'Arc', icon: Rainbow, description: 'Click the centre, the start and the end', keywords: ['curve'] },
+  arc: { label: 'Arc (centre)', icon: Rainbow, description: 'Click the centre, the start and the end', keywords: ['curve', 'center arc'] },
+  arc_radius: { label: 'Arc (start-end-bulge)', icon: Rainbow, description: 'Click the start, the end, and a point on the arc', keywords: ['curve', '3 point arc', 'radius arc'] },
+  arc_tangent: { label: 'Arc (tangent)', icon: Rainbow, description: 'Click the start, a point along the tangent, and the end', keywords: ['curve', 'tangent arc'] },
   circle: { label: 'Circle', icon: Circle, description: 'Click the centre and a point on it', keywords: ['round'] },
   polygon: { label: 'Polygon', icon: Hexagon, description: 'Click the centre and a corner: joined detail lines, inscribed or circumscribed, sides typed in the bar', keywords: ['hexagon', 'octagon', 'joined lines'] },
   polyline: { label: 'Lines (chain)', icon: Waypoints, description: 'Click each point: one detail line per segment, joined end to end. Click the first point to close; Enter finishes', keywords: ['chain', 'polyline', 'path', 'joined lines'] },
@@ -170,7 +174,31 @@ export function annotateTab(ctx: BuildingModelRibbonContext, leading: RibbonGrou
     },
     { id: 'detail', label: 'Detail', commands: [detailLine(ctx), ...(draft ? [filletArc(ctx, draft)] : []), drawingCommand(ctx, 'cloud', 'Revision cloud', Cloud, 'Cloud a change on the sheet', ['revision'])] },
     ...(draft ? [{ id: 'region', label: 'Region', commands: [region(ctx, draft, false), region(ctx, draft, true)] }] : []),
-    { id: 'text', label: 'Text', commands: [drawingCommand(ctx, 'text', 'Text', Type, 'Add a note; drag its grips to re-wrap', ['note', 'label', 'leader'])] },
+    {
+      id: 'text',
+      label: 'Text',
+      commands: [
+        drawingCommand(ctx, 'text', 'Text', Type, 'Add a note; drag its grips to re-wrap', ['note', 'label', 'leader']),
+        {
+          id: 'standard-notes',
+          label: 'Standard notes',
+          icon: FileText,
+          description: 'Drop a reusable discipline general-notes block onto this sheet or view (same library scripts use)',
+          keywords: ['general notes', 'notes library', 'specifications', 'code notes', 'boilerplate'],
+          disabledReason: ctx.placeStandardNotes ? ctx.placeStandardNotes.disabledReason : OPEN_A_DRAWING,
+          children: STANDARD_NOTE_SETS.map((set) => ({
+            id: `standard-notes-${set.id}`,
+            label: set.title,
+            icon: FileText,
+            description: `${set.codeBasis} — ${set.notes.length} notes`,
+            disabledReason: ctx.placeStandardNotes ? ctx.placeStandardNotes.disabledReason : OPEN_A_DRAWING,
+            run: () => ctx.placeStandardNotes?.run(set.id),
+            testId: `ribbon-standard-notes-${set.id}`,
+          })),
+          testId: 'ribbon-standard-notes',
+        },
+      ],
+    },
     {
       id: 'tag',
       label: 'Tag',
@@ -213,6 +241,21 @@ export function annotateTab(ctx: BuildingModelRibbonContext, leading: RibbonGrou
           },
         ]
       : []),
+    {
+      id: 'review',
+      label: 'Review',
+      commands: [
+        drawingCommand(
+          ctx,
+          'markup',
+          'Marker',
+          PenTool,
+          'Sketch freehand felt-tip redlines or highlighter strokes directly on the sheet for an agent to inspect (non-printing by default)',
+          ['markup', 'redline', 'pen', 'marker', 'highlighter', 'sketch', 'review', 'stylus'],
+          'M',
+        ),
+      ],
+    },
   ]
   return { id: 'annotate', label: 'Annotate', groups }
 }

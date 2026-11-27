@@ -47,7 +47,10 @@ function visibleInk(scene: ReturnType<typeof buildSheetSceneFor>): number {
         return within(p.a) || within(p.b);
       case "rect":
         return true;
+      case "circle":
+        return within(p.at);
       case "fill":
+      case "stroke":
         return p.points.some(within);
       case "text":
         return within(p.at);

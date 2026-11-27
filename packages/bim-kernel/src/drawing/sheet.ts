@@ -8,8 +8,8 @@ import type { BimElement, ElementId, ModelState, Vec2 } from "../types";
 import { headlineKindValue, storedField } from "../kinds";
 import { elementKindTable } from "../registry/element-kind-point";
 import type { PlanGraphic } from "../registry/kind-row-faces";
-import { dashOf, graphicSegments, penOf, planGraphicsContext, planGraphicsOf } from "./plan-graphics";
-import { drawPartSymbol, drawRunFitting, drawRunSegment } from "./runs";
+import { dashOf, fillHexToGrey, graphicSegments, penOf, planGraphicsContext, planGraphicsOf } from "./plan-graphics";
+import { PartLabelIndex, drawPartSymbol, drawRunFitting, drawRunSegment, partPlanOutline } from "./runs";
 
 /** Paper-space drawing primitives, in millimetres, origin top-left, y down. */
 export type Pen = "thin" | "medium" | "wide" | "heavy";
@@ -39,6 +39,15 @@ export interface PrimitiveStyle {
   readonly widthMm?: number;
 }
 
+/**
+ * Optional owner-item id attached to primitives emitted by an interactive
+ * annotation (e.g. a rich-text note's leaders) so the editor can hide them
+ * while the user is dragging that item live without repainting the whole sheet.
+ */
+interface PrimitiveOwner {
+  readonly noteId?: string;
+}
+
 export type Primitive =
   | ({
       readonly kind: "line";
@@ -47,10 +56,27 @@ export type Primitive =
       readonly pen: Pen;
       readonly dash?: readonly number[];
       readonly tone?: Tone;
-    } & PrimitiveStyle)
-  | ({ readonly kind: "rect"; readonly at: Vec2; readonly size: Vec2; readonly pen: Pen } & PrimitiveStyle)
+    } & PrimitiveStyle &
+      PrimitiveOwner)
+  | ({ readonly kind: "rect"; readonly at: Vec2; readonly size: Vec2; readonly pen: Pen } & PrimitiveStyle & PrimitiveOwner)
+  /** A true vector circle outline on paper (center `at`, radius `r` paper mm) so circular plan symbols stay crisp at any zoom or print DPI. */
+  | ({ readonly kind: "circle"; readonly at: Vec2; readonly r: number; readonly pen: Pen; readonly dash?: readonly number[]; readonly tone?: Tone } & PrimitiveStyle & PrimitiveOwner)
   /** A filled polygon with no outline (section poche, shaded surfaces). `grey`: 0 black, 1 white; a tone lightens it. `color` replaces the grey in colour; a monochrome print uses the grey. */
-  | ({ readonly kind: "fill"; readonly points: readonly Vec2[]; readonly grey: number; readonly tone?: Tone } & Pick<PrimitiveStyle, "color">)
+  | ({ readonly kind: "fill"; readonly points: readonly Vec2[]; readonly grey: number; readonly tone?: Tone } & Pick<PrimitiveStyle, "color"> & PrimitiveOwner)
+  /** A freehand marker or highlighter stroke in paper mm with smooth rounded caps/joins and optional translucency. */
+  | ({
+      readonly kind: "stroke";
+      readonly points: readonly Vec2[];
+      readonly widthMm: number;
+      readonly opacity?: number;
+      readonly closed?: boolean;
+      /** Draw straight polyline corners instead of quadratic smoothing (used for smart-snapped rectangles/lines). */
+      readonly sharp?: boolean;
+      /** Keep vivid ink colour even when printing a monochrome/black-only sheet (used for review markups). */
+      readonly preserveColor?: boolean;
+      readonly markupId?: string;
+    } & Pick<PrimitiveStyle, "color"> &
+      PrimitiveOwner)
   | ({
       readonly kind: "text";
       readonly at: Vec2;
@@ -59,12 +85,22 @@ export type Primitive =
       readonly size: number;
       readonly anchor: "start" | "middle" | "end";
       readonly bold?: boolean;
+      readonly italic?: boolean;
       readonly tone?: Tone;
       /** Degrees, clockwise on paper, about `at` (a tag turned along its run). Absent: level. */
       readonly rotate?: number;
       /** A font id from the scene's `fonts`. Absent: the standard sheet font. */
       readonly font?: string;
-    } & Pick<PrimitiveStyle, "color">);
+      /** CSS/standard font family override from a model text style (e.g. `"Helvetica"`, `"Arial"`, `"Courier New"`). */
+      readonly fontFamily?: string;
+      /** Opaque paper-white background mask behind the text so crossing linework stays broken and readable. */
+      readonly mask?: boolean;
+      /** Vertical alignment of `at.y`: `"baseline"` (default) or `"middle"` (vertically centered on `at.y`, ideal for inline run codes). */
+      readonly vAlign?: "baseline" | "middle";
+      /** Optional clickable http(s) URL (e.g. a manufacturer cut sheet link in a schedule cell). */
+      readonly href?: string;
+    } & Pick<PrimitiveStyle, "color"> &
+      PrimitiveOwner);
 
 /** A font a scene's text uses besides the standard sheet font: its id, family, weight and the file the writers load. */
 export interface SceneFont {
@@ -302,6 +338,26 @@ export function buildSheetScene(model: ModelState, def: SheetDefinition): SheetS
   if (def.references?.length) drawReferences(prims, def, toPaper);
 
   const graphicsCtx = planGraphicsContext(model, { scale: def.scale, levelId: "", detail: "medium", drawing: "sheet" });
+  const takenPartBoxes = new PartLabelIndex(def.scale);
+  const wallPad = 0.6 * def.scale;
+  const partPad = 0.45 * def.scale;
+  for (const el of elementValues(model.elements)) {
+    if (el.kind === "wall") {
+      const half = el.thickness / 2 + wallPad;
+      takenPartBoxes.add({
+        min: { x: Math.min(el.start.x, el.end.x) - half, y: Math.min(el.start.y, el.end.y) - half },
+        max: { x: Math.max(el.start.x, el.end.x) + half, y: Math.max(el.start.y, el.end.y) + half },
+      });
+    } else if (el.kind === "part") {
+      const b = partPlanOutline(model, el, { detail: "medium", scale: def.scale }).bounds;
+      if (b) {
+        takenPartBoxes.add({
+          min: { x: b.min.x - partPad, y: b.min.y - partPad },
+          max: { x: b.max.x + partPad, y: b.max.y + partPad },
+        });
+      }
+    }
+  }
   for (const el of elementValues(model.elements)) {
     const graphics = planGraphicsOf(el, graphicsCtx);
     if (graphics) {
@@ -320,7 +376,32 @@ export function buildSheetScene(model: ModelState, def: SheetDefinition): SheetS
         drawRunFitting(model, el, line);
         break;
       case "part":
-        drawPartSymbol(model, el, line, (at, text, size) => prims.push({ kind: "text", at: toPaper(at), text, size, anchor: "middle" }));
+        drawPartSymbol(
+          model,
+          el,
+          line,
+          (at, text, size, anchor, style) =>
+            prims.push({
+              kind: "text",
+              at: toPaper(at),
+              text,
+              size,
+              anchor: anchor ?? "middle",
+              ...(style?.mask ? { mask: true } : {}),
+              ...(style?.bold ? { bold: true } : {}),
+              ...(style?.italic ? { italic: true } : {}),
+              ...(style?.fontFamily ? { fontFamily: style.fontFamily } : {}),
+              ...(style?.color ? { color: style.color } : {}),
+            }),
+          null,
+          "medium",
+          {
+            scale: def.scale,
+            fill: (pts, grey) => prims.push({ kind: "fill", points: pts.map(toPaper), grey }),
+            circle: (c, r, pen) => prims.push({ kind: "circle", at: toPaper(c), r: r / def.scale, pen }),
+            takenBoxes: takenPartBoxes,
+          },
+        );
         break;
       default:
         break;
@@ -427,6 +508,9 @@ function drawSheetGraphics(el: BimElement, graphics: readonly PlanGraphic[], vie
       case "line":
       case "polyline":
       case "arc": {
+        if (g.form === "polyline" && g.closed && g.fill && g.points.length >= 3) {
+          prims.push({ kind: "fill", points: g.points.map(toPaper), grey: fillHexToGrey(g.fill) });
+        }
         const pen = penOf(g.pen);
         const dash = dashOf(g.dash);
         for (const [a, b] of graphicSegments(g)) prims.push({ kind: "line", a: toPaper(a), b: toPaper(b), pen, dash });

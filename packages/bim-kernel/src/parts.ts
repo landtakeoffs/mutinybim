@@ -5,6 +5,7 @@ import type { Discipline, ParamValue, PartInstance, PartTypeElement, Vec2 } from
 import { dimSchema, PARAM_NAME, type Dim } from "./part-dim";
 import { evaluateFormula, FormulaError, formulaNames, parseFormula } from "./part-model/formula";
 import { modelDims, resolvePartModel } from "./part-model/resolve";
+import { sizeNameCollision } from "./part-model/types-table";
 import { anyPartModelSchema, isPartModel2 } from "./part-model/schema-2";
 import { clearanceZoneIssues, clearanceZonesSchema, partPositionIssues, partPositionsSchema } from "./part-model/clearance";
 import { INTAKE_KINDS, type IntakeKind } from "./part-model/intake-hood";
@@ -98,7 +99,12 @@ export const PARAM_UNITS = LEGACY_PARAM_UNITS;
 /** @deprecated The stored v1 name; the meaning is `paramUnitBinding(unit)`. */
 export type ParamUnit = (typeof PARAM_UNITS)[number];
 
-const paramValueSchema = z.union([z.number().finite(), z.string().max(400), z.boolean()]);
+/** Default text parameter character limit (kept for older peers without `parts:long_text_values`). */
+export const PARAM_TEXT_DEFAULT_MAX = 400;
+/** Maximum text parameter character limit for structured text payloads when a field opts into `maxLength`. */
+export const PARAM_TEXT_LONG_MAX = 65_536;
+
+const paramValueSchema = z.union([z.number().finite(), z.string().max(PARAM_TEXT_LONG_MAX), z.boolean()]);
 
 export const paramDefSchema = z.object({
   name: z.string().regex(PARAM_NAME, "lower_snake_case, starting with a letter"),
@@ -119,6 +125,7 @@ export const paramDefSchema = z.object({
     .optional(),
   min: z.number().finite().optional(),
   max: z.number().finite().optional(),
+  maxLength: z.number().int().min(1).max(PARAM_TEXT_LONG_MAX).optional(),
   choices: z.array(z.string().min(1).max(80)).min(1).max(50).optional(),
   required: z.boolean().optional(),
   default: paramValueSchema.optional(),
@@ -209,12 +216,61 @@ export const primitiveSchema = z.discriminatedUnion("kind", [
 ]);
 export type PartPrimitive = z.infer<typeof primitiveSchema>;
 
+const symbolUnitsSchema = z.enum(["model", "paper"]);
+const symbolPenSchema = z.enum(["thin", "medium", "wide", "heavy"]);
+const symbolFillSchema = z.enum(["solid", "mask"]);
+const symbolDetailLevelsSchema = z.array(z.enum(["coarse", "medium", "fine"])).min(1).max(3);
+/**
+ * Optional visibility condition evaluated against a placed part's resolved
+ * parameters (`values` merged over `typeValues` and parameter defaults).
+ * Lets any part type drive plan symbol graphics (fills, hatches, marks) directly
+ * from instance parameters without duplicating types.
+ */
+export const symbolConditionSchema = z
+  .object({
+    param: z.string().regex(PARAM_NAME, "lower_snake_case, starting with a letter"),
+    equals: paramValueSchema.optional(),
+    truthy: z.boolean().optional(),
+  })
+  .strict();
+export type SymbolCondition = z.infer<typeof symbolConditionSchema>;
+
+const symbolCommonShape = {
+  /** Coordinate units: "model" (default, mm in model space) or "paper" (annotative mm on paper, scaled by view scale). */
+  units: symbolUnitsSchema.optional(),
+  /**
+   * Minimum plotted paper span (mm) when `units` is "model": at large scales the
+   * symbol draws at true model size; when zoomed out so its plotted span would
+   * shrink below `minPaperMm`, the whole model-unit symbol scales up uniformly
+   * around its origin `(0, 0)` so it stays legible in the field.
+   */
+  minPaperMm: z.number().positive().max(100).optional(),
+  pen: symbolPenSchema.optional(),
+  detailLevels: symbolDetailLevelsSchema.optional(),
+  /** Keep glyph strokes upright (world-aligned) even when the part is rotated on a wall. */
+  upright: z.boolean().optional(),
+  /** Show this primitive only when the named parameter matches the condition. */
+  when: symbolConditionSchema.optional(),
+};
+
 export const symbolSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("rect"), center: dim2Schema, size: dim2Schema }),
-  z.object({ kind: z.literal("circle"), center: dim2Schema, radius: dimSchema }),
-  z.object({ kind: z.literal("line"), from: dim2Schema, to: dim2Schema }),
-  z.object({ kind: z.literal("polyline"), points: z.array(dim2Schema).min(2).max(64), closed: z.boolean() }),
-  z.object({ kind: z.literal("text"), at: dim2Schema, text: z.string().min(1).max(40), heightMm: z.number().positive().max(1000) }),
+  z.object({ kind: z.literal("rect"), center: dim2Schema, size: dim2Schema, fill: symbolFillSchema.optional(), ...symbolCommonShape }),
+  z.object({ kind: z.literal("circle"), center: dim2Schema, radius: dimSchema, fill: symbolFillSchema.optional(), ...symbolCommonShape }),
+  z.object({ kind: z.literal("arc"), center: dim2Schema, radius: dimSchema, startDeg: z.number().finite(), sweepDeg: z.number().finite(), ...symbolCommonShape }),
+  z.object({ kind: z.literal("line"), from: dim2Schema, to: dim2Schema, ...symbolCommonShape }),
+  z.object({ kind: z.literal("polyline"), points: z.array(dim2Schema).min(2).max(64), closed: z.boolean(), fill: symbolFillSchema.optional(), ...symbolCommonShape }),
+  z.object({
+    kind: z.literal("text"),
+    at: dim2Schema,
+    text: z.string().min(1).max(40),
+    heightMm: z.number().positive().max(1000),
+    anchor: z.enum(["start", "middle", "end"]).optional(),
+    /** Upright (unrotated) world/paper offset added after placing `at` so subscripts stay cleanly positioned on any rotation. */
+    uprightOffset: z.tuple([z.number().finite(), z.number().finite()]).optional(),
+    /** Opaque paper-white background mask behind the glyph so crossing linework stays readable. */
+    mask: z.boolean().optional(),
+    ...symbolCommonShape,
+  }),
 ]);
 export type SymbolPrimitive = z.infer<typeof symbolSchema>;
 
@@ -329,11 +385,19 @@ export const partSourceSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("ifc"), entity: z.string().min(1).max(80), typeName: z.string().min(1).max(200), boundingBoxGeometry: z.literal(true) }),
 ]);
 
+/** Default mounting/hosting behavior declared by a part type (discipline-neutral). */
+export const PART_HOSTING_MODES = ["free", "wall_face", "ceiling", "floor"] as const;
+export type PartHostingMode = (typeof PART_HOSTING_MODES)[number];
+
 export const partTypeDefinitionSchema = z.object({
   familyName: z.string().min(1).max(200),
   typeName: z.string().min(1).max(200),
+  /** Optional standard AEC Type Mark shared by every instance of this type (e.g. "SD-1", "RG-1", "F1", "WC-1"). */
+  typeMark: z.string().trim().max(48).optional(),
   category: z.enum(PART_CATEGORIES),
   description: z.string().max(400).optional(),
+  /** Optional placement hosting rule: `"wall_face"` snaps flush onto wall finish faces (+Y into room). */
+  hosting: z.enum(PART_HOSTING_MODES).optional(),
   typeParams: z.array(paramDefSchema).max(80),
   typeValues: z.record(z.string(), paramValueSchema),
   instanceParams: z.array(paramDefSchema).max(80),
@@ -393,7 +457,7 @@ function referencedParams(def: PartTypeDefinition): Set<string> {
   }
   for (const s of def.symbol) {
     if (s.kind === "rect") each([...s.center, ...s.size]);
-    else if (s.kind === "circle") each([...s.center, s.radius]);
+    else if (s.kind === "circle" || s.kind === "arc") each([...s.center, s.radius]);
     else if (s.kind === "line") each([...s.from, ...s.to]);
     else if (s.kind === "polyline") each(s.points.flat());
     else each(s.at);
@@ -430,8 +494,11 @@ export function checkParamValue(def: ParamDef, value: ParamValue): string | null
       if (def.max !== undefined && value > def.max) return `${def.label} must be at most ${def.max}`;
       return null;
     case "text":
-    case "material":
-      return typeof value === "string" ? null : `${def.label} must be text`;
+    case "material": {
+      if (typeof value !== "string") return `${def.label} must be text`;
+      const limit = def.maxLength ?? PARAM_TEXT_DEFAULT_MAX;
+      return value.length <= limit ? null : `${def.label} must be at most ${limit} characters`;
+    }
     case "boolean":
       return typeof value === "boolean" ? null : `${def.label} must be yes or no`;
     case "choice":
@@ -495,7 +562,7 @@ export function partTypeIssues(def: PartTypeDefinition): PartIssue[] {
   issues.push(...clearanceZoneIssues(def.clearances));
   issues.push(...partPositionIssues(def.positions));
   for (const f of def.tagFields) {
-    if (f !== "mark" && f !== "type_name" && !names.has(f)) issues.push({ field: f, message: `Tag field ${f} is not a parameter` });
+    if (f !== "mark" && f !== "type_mark" && f !== "type_name" && !names.has(f)) issues.push({ field: f, message: `Tag field ${f} is not a parameter` });
   }
   const connectorIds = new Set<string>();
   for (const c of def.connectors) {
@@ -597,6 +664,8 @@ function modelIssues(def: PartTypeDefinition): PartIssue[] {
   const model = def.model;
   if (!model) return [];
   const issues: PartIssue[] = [];
+  const clash = def.source.kind === "script" ? null : sizeNameCollision(model.types);
+  if (clash) issues.push({ field: "types", message: clash });
   const typeParams = new Map(def.typeParams.map((p) => [p.name, p]));
   const rows = model.types.length > 0 ? model.types : [{ name: def.typeName, values: def.typeValues }];
   for (const row of rows) {
@@ -695,12 +764,25 @@ export type ResolvedPrimitive =
   | { readonly kind: "cylinder"; readonly center: Vec3; readonly radius: number; readonly height: number; readonly axis: "x" | "y" | "z" }
   | { readonly kind: "extrusion"; readonly profile: readonly Vec2[]; readonly z: number; readonly height: number };
 
+export type SymbolUnits = "model" | "paper";
+export type SymbolPen = "thin" | "medium" | "wide" | "heavy";
+export type SymbolFill = "solid" | "mask";
+
+interface ResolvedSymbolCommon {
+  readonly units?: SymbolUnits;
+  readonly minPaperMm?: number;
+  readonly pen?: SymbolPen;
+  readonly detailLevels?: readonly ("coarse" | "medium" | "fine")[];
+  readonly upright?: boolean;
+}
+
 export type ResolvedSymbol =
-  | { readonly kind: "rect"; readonly center: Vec2; readonly size: Vec2 }
-  | { readonly kind: "circle"; readonly center: Vec2; readonly radius: number }
-  | { readonly kind: "line"; readonly from: Vec2; readonly to: Vec2 }
-  | { readonly kind: "polyline"; readonly points: readonly Vec2[]; readonly closed: boolean }
-  | { readonly kind: "text"; readonly at: Vec2; readonly text: string; readonly heightMm: number };
+  | ({ readonly kind: "rect"; readonly center: Vec2; readonly size: Vec2; readonly fill?: SymbolFill } & ResolvedSymbolCommon)
+  | ({ readonly kind: "circle"; readonly center: Vec2; readonly radius: number; readonly fill?: SymbolFill } & ResolvedSymbolCommon)
+  | ({ readonly kind: "arc"; readonly center: Vec2; readonly radius: number; readonly startDeg: number; readonly sweepDeg: number } & ResolvedSymbolCommon)
+  | ({ readonly kind: "line"; readonly from: Vec2; readonly to: Vec2 } & ResolvedSymbolCommon)
+  | ({ readonly kind: "polyline"; readonly points: readonly Vec2[]; readonly closed: boolean; readonly fill?: SymbolFill } & ResolvedSymbolCommon)
+  | ({ readonly kind: "text"; readonly at: Vec2; readonly text: string; readonly heightMm: number; readonly anchor?: "start" | "middle" | "end"; readonly uprightOffset?: readonly [number, number]; readonly mask?: boolean } & ResolvedSymbolCommon);
 
 export interface ResolvedConnector {
   readonly id: string;
@@ -749,23 +831,67 @@ export function resolveGeometry(def: PartTypeDefinition, values: Readonly<Record
   });
 }
 
+/** True when a symbol primitive's optional `when` condition matches a part's resolved parameters. */
+export function symbolConditionMatches(when: SymbolCondition | undefined, def: PartTypeDefinition, values: Readonly<Record<string, ParamValue>>): boolean {
+  if (!when) return true;
+  let val: ParamValue | undefined = values[when.param];
+  if (val === undefined) val = def.typeValues[when.param];
+  if (val === undefined) {
+    const p = def.instanceParams.find((x) => x.name === when.param) ?? def.typeParams.find((x) => x.name === when.param);
+    val = p?.default;
+  }
+  if (when.equals !== undefined) return val === when.equals;
+  if (when.truthy !== undefined) {
+    const isTruthy = typeof val === "boolean" ? val : typeof val === "number" ? val !== 0 : typeof val === "string" ? val.trim() !== "" && val.trim().toLowerCase() !== "false" && val.trim().toLowerCase() !== "none" : false;
+    return isTruthy === when.truthy;
+  }
+  return Boolean(val);
+}
+
 export function resolveSymbol(def: PartTypeDefinition, values: Readonly<Record<string, ParamValue>> = {}): ResolvedSymbol[] {
   const r = (d: Dim) => resolveDim(def, values, d);
   const v2 = (t: readonly [Dim, Dim]): Vec2 => ({ x: r(t[0]), y: r(t[1]) });
-  return def.symbol.map((s): ResolvedSymbol => {
+  const out: ResolvedSymbol[] = [];
+  for (const s of def.symbol) {
+    if (!symbolConditionMatches(s.when, def, values)) continue;
+    const common: ResolvedSymbolCommon = {
+      ...(s.units !== undefined ? { units: s.units } : {}),
+      ...(s.minPaperMm !== undefined ? { minPaperMm: s.minPaperMm } : {}),
+      ...(s.pen !== undefined ? { pen: s.pen } : {}),
+      ...(s.detailLevels !== undefined ? { detailLevels: s.detailLevels } : {}),
+      ...(s.upright ? { upright: true } : {}),
+    };
     switch (s.kind) {
       case "rect":
-        return { kind: "rect", center: v2(s.center), size: v2(s.size) };
+        out.push({ kind: "rect", center: v2(s.center), size: v2(s.size), ...(s.fill !== undefined ? { fill: s.fill } : {}), ...common });
+        break;
       case "circle":
-        return { kind: "circle", center: v2(s.center), radius: r(s.radius) };
+        out.push({ kind: "circle", center: v2(s.center), radius: r(s.radius), ...(s.fill !== undefined ? { fill: s.fill } : {}), ...common });
+        break;
+      case "arc":
+        out.push({ kind: "arc", center: v2(s.center), radius: r(s.radius), startDeg: s.startDeg, sweepDeg: s.sweepDeg, ...common });
+        break;
       case "line":
-        return { kind: "line", from: v2(s.from), to: v2(s.to) };
+        out.push({ kind: "line", from: v2(s.from), to: v2(s.to), ...common });
+        break;
       case "polyline":
-        return { kind: "polyline", points: s.points.map(v2), closed: s.closed };
+        out.push({ kind: "polyline", points: s.points.map(v2), closed: s.closed, ...(s.fill !== undefined ? { fill: s.fill } : {}), ...common });
+        break;
       case "text":
-        return { kind: "text", at: v2(s.at), text: s.text, heightMm: s.heightMm };
+        out.push({
+          kind: "text",
+          at: v2(s.at),
+          text: s.text,
+          heightMm: s.heightMm,
+          ...(s.anchor !== undefined ? { anchor: s.anchor } : {}),
+          ...(s.uprightOffset !== undefined ? { uprightOffset: s.uprightOffset } : {}),
+          ...(s.mask ? { mask: true } : {}),
+          ...common,
+        });
+        break;
     }
-  });
+  }
+  return out;
 }
 
 export function resolveConnectors(def: PartTypeDefinition, values: Readonly<Record<string, ParamValue>> = {}): ResolvedConnector[] {
@@ -849,12 +975,13 @@ export function partFootprint(type: PartTypeElement, part: PartInstance): Vec2[]
   ].map((p) => partToWorld(part, p));
 }
 
-/** What a tag on the part reads: its tag fields joined, falling back to mark then type name. */
+/** What a tag on the part reads: its tag fields joined, falling back to mark, typeMark, then type name. */
 export function partTagText(type: PartTypeElement, part: PartInstance): string {
   const def = type.definition;
   const parts = def.tagFields
     .map((f) => {
-      if (f === "mark") return part.mark;
+      if (f === "mark") return part.mark || def.typeMark || "";
+      if (f === "type_mark") return def.typeMark ?? "";
       if (f === "type_name") return def.typeName;
       const v = paramValue(def, part.values, f);
       if (v === undefined || v === "") return "";
@@ -863,7 +990,7 @@ export function partTagText(type: PartTypeElement, part: PartInstance): string {
     })
     .filter((s) => s.length > 0);
   if (parts.length > 0) return parts.join(" ");
-  return part.mark || def.typeName;
+  return part.mark || def.typeMark || def.typeName;
 }
 
 const UNIT_SUFFIX: Readonly<Record<ParamUnit, string>> = LEGACY_PARAM_UNIT_SUFFIXES;
@@ -884,6 +1011,9 @@ export const PACK_PARAMETER_KEY = /^[a-z][a-z0-9_]*\.[a-z0-9][a-z0-9_.]*$/;
 
 /** The protocol feature for part `values` carrying pack parameter keys. */
 export const PARTS_PACK_VALUES_FEATURE = "parts:pack_values";
+
+/** The protocol feature for text parameter values exceeding 400 characters (up to 65536). */
+export const PARTS_LONG_TEXT_VALUES_FEATURE = "parts:long_text_values";
 
 /** The protocol feature for part parameters stored with a unit code (not a v1 unit name). */
 export const PARTS_UNIT_CODES_FEATURE = "parts:unit_codes";

@@ -14,9 +14,11 @@ import type { CategoryView, LoadedReference, ModelViewer3D, Pick, ReferenceItemP
 import type { EditorHostCapabilities, EditorReferencesPort } from '@permitzip/bim-editor-host'
 import { unavailableWords } from '@permitzip/bim-editor/host/unavailable'
 import type { RevitElementParameters, RevitParametersResponse, UnplacedElementsResponse, UnplacedElementView } from '../contracts/building-model/revit-parameters-contract'
-import { connectionProblem, editsPausedMessage, operatorMessage, problemForDenied, type ConnectionProblem } from './operator-messages'
-import { ALIGN_SNAP_MM, GRID_MM, MM_PER_FT, MM_PER_IN, POINT_SNAP_MM, defaultHeightMm, describeElement, feetInches, newElementId, partLabel, snapHint, snapPoint, snapTargets, type SnapTarget } from './placement'
+import { AWAITING_WRITE_ACCESS, MODEL_VIEW_ONLY, connectionProblem, editsPausedMessage, operatorMessage, problemForDenied, type ConnectionProblem } from './operator-messages'
+import { ALIGN_SNAP_MM, GRID_MM, MM_PER_FT, MM_PER_IN, POINT_SNAP_MM, WALL_FACE_SNAP_MM, defaultHeightMm, describeElement, feetInches,  nearestLinkedWallFace,
+  newElementId, partLabel, snapHint, snapPoint, snapTargets, type SnapTarget } from './placement'
 import { linkedSnapNear } from './linked-reference/linked-reference-store'
+import { projectFamilyTable, projectPartTypesToSave } from '../contracts/bim/firm-part-versions'
 import { isStarterLevelRace, starterLevelCommand } from './levels/starter-level'
 import { axisBadge, resolveRoutePoint, snapDrag, type AxisLock, type RouteAxis } from './route-axis'
 import { hostForPlacement, placementOnSurface, routeStartOnSurface, type RouteStart } from './surface-point'
@@ -106,6 +108,8 @@ export interface SessionEvents {
   onBranchState?(branch: BranchRef): void
   /** The places the route being drawn meets an add-on's rule (a rated wall, a ceiling), in the add-on's words; empty when none or not routing. */
   onRouteChecks?(checks: readonly RouteCheck[]): void
+  /** The 3D WebGL viewer could not start (e.g. GPU process reset or WebGL unavailable); 2D plans, sheets and schedules stay live. */
+  onViewerError?(message: string | null): void
 }
 
 /** One place the route being drawn meets a rule: the Route tool's line for it and where its tick goes on plan. */
@@ -379,6 +383,7 @@ function boxAccepts(el: BimElement | undefined, categories: ReadonlySet<BoxCateg
   if (el.kind === 'run_segment' || el.kind === 'run_fitting') return categories.has(el.domain === 'pipe' ? 'pipe' : 'duct')
   if (el.kind === 'duct_segment' || el.kind === 'tap' || el.kind === 'elbow') return categories.has(el.service && el.service !== 'air' ? 'pipe' : 'duct')
   if (el.kind === 'terminal' || el.kind === 'equipment') return categories.has('parts')
+  if (el.kind === 'wall' || el.kind === 'opening' || el.kind === 'column' || el.kind === 'slab' || el.kind === 'ceiling') return true
   return false
 }
 
@@ -513,6 +518,7 @@ export class ModelSession {
   private connectTimer: ReturnType<typeof setTimeout> | null = null
   private authority: { readonly url: string; readonly modelId: string } | null = null
   private status: ConnectionStatus = 'connecting'
+  private copyCanWrite?: boolean
   /**
    * When the oldest question still waiting for any answer went out on the current socket (Date.now ms),
    * null once the server has said anything since. Judged from what we asked, not from wall-clock quiet:
@@ -533,8 +539,9 @@ export class ModelSession {
   private referenceInfo = new Map<string, ReferenceInfo>()
   private unplaced = new Map<string, Map<string, UnplacedElementView>>()
   private revitParametersUrl: string | null = null
-  /** Your views/sheets edits, undone client-side by restoring the records (no redo). */
+  /** Your views/sheets edits, undone and redone client-side by restoring the records. */
   private readonly documentUndoStack: DocumentUndo[] = []
+  private readonly documentRedoStack: DocumentUndo[] = []
   /** Orders both undo stacks, so Undo takes back whichever of your edits is newest. */
   private undoSeq = 0
   /** Bumped on every selection, so a slow answer for an earlier pick never overwrites the current one. */
@@ -664,13 +671,22 @@ export class ModelSession {
     this.ratedRoutes = ratedRoutes
     this.viewerModule = viewerModule
     this.syncModule = sync
-    this.viewer = new viewerModule.ModelViewer3D(this.container, {
-      workerUrl: '/api/building-model/fragments-worker',
-      onStats: (stats) => this.events.onStats(stats),
-      colors: this.viewerColors,
-    })
-    this.viewer.setDisplayContext(this.displayContext)
-    this.viewer.setCategoryView(this.categoryView)
+    try {
+      this.viewer = new viewerModule.ModelViewer3D(this.container, {
+        workerUrl: '/api/building-model/fragments-worker',
+        onStats: (stats) => this.events.onStats(stats),
+        colors: this.viewerColors,
+      })
+      this.viewer.setDisplayContext(this.displayContext)
+      this.viewer.setCategoryView(this.categoryView)
+      this.events.onViewerError?.(null)
+    } catch (err: unknown) {
+      // Do not block 2D plans, sheets, one-lines, schedules or live editing if WebGL fails to initialize.
+      console.error('[ModelSession] 3D WebGL viewer unavailable; continuing in 2D/sheets mode', err)
+      this.viewer = null
+      const msg = err instanceof Error ? err.message : 'WebGL context could not be created.'
+      this.events.onViewerError?.(msg)
+    }
     if (process.env.NODE_ENV === 'development') Reflect.set(window, '__buildingModelSession', this)
 
     // Live editing connects alongside the reference downloads; a slow or failed reference never blocks it.
@@ -679,13 +695,37 @@ export class ModelSession {
     if (authority) this.connect(sync, authority)
     this.revitParametersUrl = config.revitParametersUrl ?? null
 
-    await this.syncReferences(config.references)
-    if (this.disposed) return
-
-    this.referencesReady = true
-    this.framedWork = this.view !== null
-    await this.frameWork()
+    if (this.viewer) {
+      await this.syncReferences(config.references)
+      if (this.disposed) return
+      this.referencesReady = true
+      this.framedWork = this.view !== null
+      await this.frameWork()
+    }
     this.events.onPhase('')
+  }
+
+  /** Retry initializing the 3D WebGL viewer without disconnecting live editing or reloading the page. */
+  retry3d(): ModelViewer3D | null {
+    if (this.disposed || this.viewer || !this.viewerModule) return this.viewer
+    try {
+      this.viewer = new this.viewerModule.ModelViewer3D(this.container, {
+        workerUrl: '/api/building-model/fragments-worker',
+        onStats: (stats) => this.events.onStats(stats),
+        colors: this.viewerColors,
+      })
+      this.viewer.setDisplayContext(this.displayContext)
+      this.viewer.setCategoryView(this.categoryView)
+      this.events.onViewerError?.(null)
+      this.redraw()
+      void this.frameWork()
+      return this.viewer
+    } catch (err: unknown) {
+      console.error('[ModelSession] 3D WebGL viewer retry failed', err)
+      this.viewer = null
+      this.events.onViewerError?.(err instanceof Error ? err.message : 'WebGL context could not be created.')
+      return null
+    }
   }
 
   /**
@@ -836,6 +876,7 @@ export class ModelSession {
     this.undoStack = []
     this.redoStack = []
     this.documentUndoStack.length = 0
+    this.documentRedoStack.length = 0
     this.undoing.clear()
     this.emitUndoState()
     this.people.clear()
@@ -870,6 +911,7 @@ export class ModelSession {
   }
 
   private connect(sync: SyncModule, authority: { url: string; modelId: string }) {
+    this.copyCanWrite = undefined
     this.authority = authority
     const client = new sync.SyncClient(
       {
@@ -884,6 +926,10 @@ export class ModelSession {
       },
       this.actor,
       {
+        onWriteAccess: (canWrite) => {
+          this.copyCanWrite = canWrite
+          this.events.onStatus(this.status)
+        },
         onView: (view) => {
           this.view = view
           this.accepted = client.confirmedModel()
@@ -892,6 +938,12 @@ export class ModelSession {
         },
         onStatus: (status) => {
           this.status = status
+          if (status === 'offline') {
+            this.copyCanWrite = undefined
+            // Presence is keyed by server connection ID. A fresh socket receives a fresh roster.
+            this.people.clear()
+            this.events.onPresence(new Map())
+          }
           if (status === 'live') {
             this.deviceOffline = false
             this.clearConnectTimer()
@@ -907,7 +959,7 @@ export class ModelSession {
           this.events.onPresence(new Map(this.people))
         },
         onRemoteChange: (revision, actor) => this.events.onActivity(`${actor.name} saved revision ${revision}`),
-        onOutcome: (request, outcome) => this.settleOutcome(request, outcome),
+        onOutcome: (request, outcome, recovered) => this.settleOutcome(request, outcome, recovered),
         onModelReset: (info) => {
           // The client dropped every unsaved edit without answering them one by one.
           this.predictedIds.clear()
@@ -944,6 +996,10 @@ export class ModelSession {
 
   /** Why Move, Place, Route, Split, drags and nudges are off right now; null while the line is up (or before the model first arrives, which `canEdit` covers). */
   editPausedReason(): string | null {
+    if (this.capabilities?.requireWriteGrant) {
+      if (this.copyCanWrite === false) return MODEL_VIEW_ONLY
+      if (!this.copyCanWrite || !this.accepted || (this.status !== 'live' && this.status !== 'degraded')) return AWAITING_WRITE_ACCESS
+    }
     const client = this.client
     if (!client || this.halted || !this.accepted) return null
     if (!this.deviceOffline && (this.status === 'live' || this.status === 'degraded')) return null
@@ -1093,7 +1149,7 @@ export class ModelSession {
     const client = this.client
     const authority = this.authority
     if (this.disposed || this.halted || !client || !authority) return
-    this.attempts += 1
+    const attempt = ++this.attempts
     let token: string | null
     try {
       token = await this.getToken()
@@ -1101,7 +1157,7 @@ export class ModelSession {
       console.error('[building-model] reading the host session failed', { modelId: authority.modelId, err })
       token = null
     }
-    if (this.disposed || this.halted) return
+    if (this.disposed || this.halted || this.client !== client || this.authority !== authority || this.attempts !== attempt) return
     if (!token) {
       console.error('[building-model] no host session; not connecting live editing', { modelId: authority.modelId })
       this.events.onProblem(connectionProblem('signed_out'))
@@ -1165,9 +1221,9 @@ export class ModelSession {
   }
 
   private redraw() {
-    if (!this.viewer || !this.accepted || !this.view) return
-    this.viewer.setAuthored(this.accepted, this.preview ?? this.view)
+    if (!this.accepted || !this.view) return
     const shown = this.preview ?? this.view
+    this.viewer?.setAuthored(this.accepted, shown)
     this.events.onModel(this.accepted, shown, this.changedSinceLastModel(shown))
     if (this.selectedId) {
       const element = (this.preview ?? this.view).elements[this.selectedId]
@@ -1237,11 +1293,15 @@ export class ModelSession {
    * when they can't be known (onModel then reports null until the edit is answered).
    */
   private sendToClient(client: SyncClient, command: Command, changed?: readonly ElementId[] | null): ReturnType<SyncClient['submit']> {
+    if (this.capabilities?.requireWriteGrant) {
+      const reason = this.editPausedReason()
+      if (reason) return { ok: false, error: { code: 'forbidden', message: reason, elementIds: [] } }
+    }
     let ids = changed
     if (ids === undefined) {
       // `view` is the client's view as of its last view event (never a drag preview).
       const before = this.view
-      const predicted = before && this.kernel ? this.kernel.executeCommand(before, command) : null
+      const predicted = before && this.kernel ? this.decideLikeServer(this.kernel, before, command) : null
       ids = predicted?.ok ? touchedIds(predicted.changedIds, predicted) : null
     }
     this.submittingIds = ids
@@ -1946,7 +2006,7 @@ export class ModelSession {
       this.clearRoutePreview()
       return move
     }
-    const res = kernel.executeCommand(view, move)
+    const res = this.decideLikeServer(kernel, view, move)
     if (!res.ok) {
       d.delta = null
       this.clearRoutePreview()
@@ -2054,7 +2114,7 @@ export class ModelSession {
     if (only?.kind === 'run_segment' || (only?.kind === 'run_fitting' && !only.host && only.ports.length === 2)) {
       const kernel = this.kernel
       const plain: Command = { type: 'drag_run', elementId: only.id, delta: { ...delta } }
-      if (!kernel || kernel.executeCommand(view, plain).ok || Math.hypot(delta.x, delta.y) < 1) return plain
+      if (!kernel || kernel.executeCommand(view, plain).ok) return plain
       const flipped: Command = { ...plain, reroute: true }
       return kernel.executeCommand(view, flipped).ok ? flipped : plain
     }
@@ -2197,8 +2257,9 @@ export class ModelSession {
     if (refused !== null) console.error('[model-session] starter Level 1 was not added', { refused })
   }
 
-  private settleOutcome(request: CommandRequest, outcome: CommitOutcome) {
+  private settleOutcome(request: CommandRequest, outcome: CommitOutcome, recovered = false) {
     const mine = request.actor.id === this.actor.id && request.clientSessionId === this.client?.clientSessionId
+    const copyName = this.client?.branch()?.name ?? 'Main'
     const undo = this.undoing.get(request.idempotencyKey)
     this.undoing.delete(request.idempotencyKey)
     if (this.predictedIds.has(request.idempotencyKey)) {
@@ -2213,14 +2274,22 @@ export class ModelSession {
     }
     if (outcome.status === 'rejected') {
       const notUnderstood = this.notUnderstood.delete(request.idempotencyKey)
-      const kernelWords = outcome.error.code === 'has_dependents' || outcome.error.code === 'undo_refused' || outcome.error.code === 'conflict' || outcome.error.code === 'already_exists' || outcome.error.code === 'in_use' || outcome.error.code === 'locked'
+      const kernelWords =
+        outcome.error.code === 'has_dependents' ||
+        outcome.error.code === 'undo_refused' ||
+        outcome.error.code === 'conflict' ||
+        outcome.error.code === 'already_exists' ||
+        outcome.error.code === 'in_use' ||
+        outcome.error.code === 'locked' ||
+        (outcome.error.code === 'invalid_value' && outcome.error.message.trim().length > 0)
       const message = notUnderstood || kernelWords ? outcome.error.message : operatorMessage(outcome.error.code)
-      this.events.onActivity(notUnderstood ? message : `Your change wasn't saved. ${message}`)
+      this.events.onActivity(recovered ? `Your change wasn’t saved to ${copyName}.` : notUnderstood ? message : `Your change wasn't saved. ${message}`)
       this.events.onRefused?.(message)
       this.emitUndoState()
       return
     }
     if (!mine) return
+    if (recovered) this.events.onActivity(`Saved to ${copyName} at revision ${outcome.revision}.`)
     // Views/sheets edits are on the document undo stack already (taken when sent).
     if (this.kernel && isDocumentCommand(this.kernel, request.command)) return
     if (undo?.direction === 'undo') this.redoStack.push({ revision: outcome.revision, label: undo.label, seq: ++this.undoSeq })
@@ -2229,19 +2298,28 @@ export class ModelSession {
       this.undoStack.push({ revision: outcome.revision, label: describeCommand(this.accepted, request.command), seq: ++this.undoSeq })
       if (this.undoStack.length > 100) this.undoStack.shift()
       this.redoStack = []
+      this.documentRedoStack.length = 0
     }
     this.emitUndoState()
     if (!undo && this.view) this.events.onSaved?.(request.command, this.view)
   }
 
   undoState(): UndoState {
-    return { undo: this.newestUndo()?.label ?? null, redo: this.redoStack[this.redoStack.length - 1]?.label ?? null }
+    return { undo: this.newestUndo()?.label ?? null, redo: this.newestRedo()?.label ?? null }
   }
 
   /** Your newest undoable edit, from either stack. */
   private newestUndo(): { readonly kind: 'model' | 'document'; readonly label: string } | null {
     const model = this.undoStack[this.undoStack.length - 1]
     const doc = this.documentUndoStack[this.documentUndoStack.length - 1]
+    if (doc && (!model || doc.seq > model.seq)) return { kind: 'document', label: doc.label }
+    return model ? { kind: 'model', label: model.label } : null
+  }
+
+  /** Your newest redoable edit, from either stack. */
+  private newestRedo(): { readonly kind: 'model' | 'document'; readonly label: string } | null {
+    const model = this.redoStack[this.redoStack.length - 1]
+    const doc = this.documentRedoStack[this.documentRedoStack.length - 1]
     if (doc && (!model || doc.seq > model.seq)) return { kind: 'document', label: doc.label }
     return model ? { kind: 'model', label: model.label } : null
   }
@@ -2266,6 +2344,16 @@ export class ModelSession {
   }
 
   redo(): string | null {
+    if (this.newestRedo()?.kind === 'document') {
+      const res = this.redoDocumentEdit()
+      this.emitUndoState()
+      if (res.ok) {
+        this.events.onActivity(`Redid ${res.label}.`)
+        return null
+      }
+      this.events.onRefused?.(res.message)
+      return res.message
+    }
     return this.step('redo')
   }
 
@@ -2457,7 +2545,21 @@ export class ModelSession {
       const where = this.planeLocked ? `Work plane locked (L unlocks): ${feetInches(spec.heightMm)} above ${levelName}` : `${this.shiftHeld ? 'Shift' : 'Nothing under the pointer'}: on ${levelName}'s floor plane, ${feetInches(spec.heightMm)} up`
       target = { levelId: spec.levelId, raw, offsetMm: spec.heightMm, where, reference: this.referenceNear(clientX, clientY, raw) }
     }
-    const snapped = snapPoint(target.raw, this.snapTargetsFor(target.levelId, []), target.reference, this.workFrame ?? undefined, this.linkedNear(target.levelId, target.raw))
+    const linkedCandidates = this.linkedNear(target.levelId, target.raw)
+    const wallHit =
+      !this.shiftHeld && !target.planeId && this.view && kernel.isWallFaceMountable(spec.definition)
+        ? kernel.nearestWallFace(this.view, target.levelId, target.raw, { maxDistanceMm: WALL_FACE_SNAP_MM })
+        : null
+    const linkedWallHit =
+      !wallHit && !this.shiftHeld && !target.planeId && kernel.isWallFaceMountable(spec.definition)
+        ? nearestLinkedWallFace(target.raw, linkedCandidates, WALL_FACE_SNAP_MM)
+        : null
+    const snapped = wallHit
+      ? { point: wallHit.position, kind: 'reference' as const, label: 'wall finish face' }
+      : linkedWallHit
+        ? { point: linkedWallHit.position, kind: 'linked' as const, label: linkedWallHit.label }
+        : snapPoint(target.raw, this.snapTargetsFor(target.levelId, []), target.reference, this.workFrame ?? undefined, linkedCandidates)
+    const placementRot = wallHit ? wallHit.rotationDeg : linkedWallHit ? linkedWallHit.rotationDeg : spec.rotationDeg
     const type: PartTypeElement = { id: kernel.asElementId(spec.typeId), kind: 'part_type', version: 0, authoredRev: {}, definition: spec.definition }
     const part: PartInstance = {
       id: kernel.asElementId('placement-preview'),
@@ -2468,17 +2570,22 @@ export class ModelSession {
       levelId: kernel.asElementId(target.levelId),
       position: snapped.point,
       offsetMm: target.offsetMm,
-      rotationDeg: spec.rotationDeg,
+      rotationDeg: placementRot,
       mark: '',
       values: {},
+      ...(wallHit ? { host: { kind: 'wall_face' as const, elementId: wallHit.wallId, stationMm: wallHit.stationMm, side: wallHit.side } } : {}),
     }
     this.ghostFor(part, type, this.levelElevation(target.levelId) ?? elevation)
-    const hosted = !target.planeId && onSurface && hit ? hostForPlacement(hit, spec.heightMm, spec.definition.category, (id) => this.view?.elements[id]?.kind === 'slab', (ref) => this.referenceLabels.get(ref) ?? 'Linked model') : null
-    this.pendingPlacement = { position: snapped.point, levelId: target.levelId, offsetMm: target.offsetMm, hosted, ...(target.planeId ? { planeId: target.planeId } : {}) }
-    return `${target.where}${hosted ? `, standing on ${this.hostLabel(hosted.host)}` : ''} (${snapHint(snapped).toLowerCase()}). Click to place, R or Space to rotate, L to lock the work plane, Esc to stop.`
+    const hosted = wallHit
+      ? { host: { kind: 'wall_face' as const, elementId: wallHit.wallId, stationMm: wallHit.stationMm, side: wallHit.side }, curbMm: 0 }
+      : !target.planeId && onSurface && hit
+        ? hostForPlacement(hit, spec.heightMm, spec.definition.category, (id) => this.view?.elements[id]?.kind === 'slab', (ref) => this.referenceLabels.get(ref) ?? 'Linked model')
+        : null
+    this.pendingPlacement = { position: snapped.point, levelId: target.levelId, offsetMm: target.offsetMm, rotationDeg: placementRot, hosted, ...(target.planeId ? { planeId: target.planeId } : {}) }
+    return `${wallHit ? `${target.where}, flush on wall face` : target.where}${!wallHit && hosted ? `, standing on ${this.hostLabel(hosted.host)}` : ''} (${snapHint(snapped).toLowerCase()}). Click to place, R or Space to rotate, L to lock the work plane, Esc to stop.`
   }
 
-  private pendingPlacement: { readonly position: Vec2; readonly levelId: string; readonly offsetMm: number; readonly hosted: ReturnType<typeof hostForPlacement>; readonly planeId?: string } | null = null
+  private pendingPlacement: { readonly position: Vec2; readonly levelId: string; readonly offsetMm: number; readonly rotationDeg?: number; readonly hosted: { readonly host: PartHost; readonly curbMm: number } | null; readonly planeId?: string } | null = null
 
   /**
    * Wait until the surface under this pixel is known, linked models included
@@ -2509,6 +2616,7 @@ export class ModelSession {
     const paused = this.refusePaused()
     if (paused) return paused
     const plannedId = this.plannedPartId
+    const placementRot = at.rotationDeg ?? spec.rotationDeg
     if (plannedId) {
       const refused = this.submit({
         type: 'place_planned_part',
@@ -2516,7 +2624,7 @@ export class ModelSession {
         levelId: at.levelId,
         position: at.position,
         ...(at.planeId ? { planeId: at.planeId } : { offsetMm: at.offsetMm }),
-        rotationDeg: spec.rotationDeg,
+        rotationDeg: placementRot,
         ...(at.hosted ? { host: at.hosted.host, ...(at.hosted.curbMm > 0 ? { curbMm: at.hosted.curbMm } : {}) } : {}),
       })
       // One part, one placement: it is drawn now, so the ghost goes.
@@ -2531,7 +2639,7 @@ export class ModelSession {
       levelId: at.levelId,
       position: at.position,
       ...(at.planeId ? { planeId: at.planeId } : { offsetMm: at.offsetMm }),
-      rotationDeg: spec.rotationDeg,
+      rotationDeg: placementRot,
       ...(at.hosted ? { host: at.hosted.host, ...(at.hosted.curbMm > 0 ? { curbMm: at.hosted.curbMm } : {}) } : {}),
     })
   }
@@ -3919,17 +4027,22 @@ export class ModelSession {
    * locally and is on its way, or the plain reason it was refused. Views and
    * sheets edits are remembered for undo.
    */
-  /** Save a part definition (every size in its types table) to the project library. */
-  savePartDefinition(definition: PartTypeDefinition): string | null {
+  partFamilyForEditing(definition: PartTypeDefinition): PartTypeDefinition {
+    return this.view ? projectFamilyTable(definition, this.view.elements) : definition
+  }
+
+  /** Save edited and new sizes together, preserving independent updates to existing sizes. */
+  savePartDefinition(definition: PartTypeDefinition, baseline: PartTypeDefinition | null = null): string | null {
     const kernel = this.kernel
     if (!kernel) return "The model isn't loaded yet."
     let types: ReturnType<KernelModule['definitionTypes']>
     try {
-      types = kernel.definitionTypes(definition)
+      types = projectPartTypesToSave(definition, baseline, this.view?.elements ?? {})
     } catch (err) {
       console.error('[model-session] part definition sizes', err)
       return err instanceof Error ? err.message : 'The sizes table can’t be saved'
     }
+    if (!types.length) return null
     return this.submitCommand({ type: 'save_part_types', label: `Save ${kernel.partGroupName(definition)}`, types }, `Save ${kernel.partGroupName(definition)}`)
   }
 
@@ -3938,7 +4051,7 @@ export class ModelSession {
     const client = this.client
     if (!client || !kernel) return "Live editing isn't connected, so changes can't be saved."
     const before = client.view()
-    const predicted = before ? kernel.executeCommand(before, command) : null
+    const predicted = before ? this.decideLikeServer(kernel, before, command) : null
     const res = this.sendToClient(client, command, predicted?.ok ? touchedIds(predicted.changedIds, predicted) : null)
     if (!res.ok) return res.error.message
     if (before && predicted?.ok && isDocumentCommand(kernel, command) && command.type !== 'restore_document_elements') {
@@ -3950,6 +4063,8 @@ export class ModelSession {
       }
       this.documentUndoStack.push(entry)
       if (this.documentUndoStack.length > 50) this.documentUndoStack.shift()
+      this.documentRedoStack.length = 0
+      this.redoStack = []
       this.emitUndoState()
     }
     return null
@@ -3984,6 +4099,46 @@ export class ModelSession {
     const refusal = this.submitCommand({ type: 'restore_document_elements', items })
     if (refusal) return { ok: false, message: refusal }
     this.documentUndoStack.pop()
+    this.documentRedoStack.push({ ...entry, seq: ++this.undoSeq })
+    if (this.documentRedoStack.length > 50) this.documentRedoStack.shift()
+    return { ok: true, label: entry.label }
+  }
+
+  /**
+   * Redo your last undone views/sheets change, unless someone changed the same
+   * element since (then nothing changes and the reason comes back).
+   */
+  redoDocumentEdit(): { ok: true; label: string } | { ok: false; message: string } {
+    const kernel = this.kernel
+    const view = this.client?.view()
+    const entry = this.documentRedoStack[this.documentRedoStack.length - 1]
+    if (!kernel || !view) return { ok: false, message: "Live editing isn't connected, so nothing can be redone." }
+    if (!entry) return { ok: false, message: 'Nothing to redo.' }
+    const strip = (el: BimElement) => kernel.canonicalJson({ ...el, version: 0, authoredRev: {} })
+    const items = []
+    for (const [id, after] of Object.entries(entry.after)) {
+      const current = view.elements[id]
+      if (!current) {
+        this.documentRedoStack.pop()
+        return { ok: false, message: `Someone changed this since your undo, so redo would overwrite their work. Nothing was redone.` }
+      }
+      const prior = entry.before[id] ?? null
+      const matchesPrior =
+        prior === null
+          ? (current as { readonly deleted?: boolean }).deleted === true
+          : strip(current) === strip(prior)
+      if (!matchesPrior) {
+        this.documentRedoStack.pop()
+        return { ok: false, message: `Someone changed this since your undo, so redo would overwrite their work. Nothing was redone.` }
+      }
+      const record = kernel.toDocumentRecord(after)
+      items.push({ elementId: id, before: record, expectedVersion: current.version })
+    }
+    const refusal = this.submitCommand({ type: 'restore_document_elements', items })
+    if (refusal) return { ok: false, message: refusal }
+    this.documentRedoStack.pop()
+    this.documentUndoStack.push({ ...entry, seq: ++this.undoSeq })
+    if (this.documentUndoStack.length > 50) this.documentUndoStack.shift()
     return { ok: true, label: entry.label }
   }
 
@@ -4028,17 +4183,11 @@ export class ModelSession {
   }
 
   dispose() {
+    if (this.disposed) return
     this.disposed = true
     this.clickHandler = null
     this.container.classList.remove(CLICK_TAKEN_CLASS)
-    this.clearConnectTimer()
-    if (this.livenessTimer) clearInterval(this.livenessTimer)
-    this.livenessTimer = null
-    this.unbindNetworkEvents?.()
-    this.unbindNetworkEvents = null
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
-    this.socket?.close()
-    this.client?.dispose()
+    this.closeLine()
     this.viewer?.dispose()
   }
 }

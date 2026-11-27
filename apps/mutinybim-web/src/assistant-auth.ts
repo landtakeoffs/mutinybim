@@ -113,6 +113,7 @@ export function bearerChallenge(origin: string, family: string, error?: "invalid
 }
 
 const BLOCKED_SCHEMES = new Set(["javascript:", "data:", "file:", "vbscript:", "about:", "blob:", "filesystem:", "ws:", "wss:"]);
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
 /**
  * Where an assistant may send people back to: https anywhere, plain http
@@ -130,8 +131,30 @@ export function redirectUriProblem(value: string): string | null {
   if (url.hash) return "has a # part";
   if (BLOCKED_SCHEMES.has(url.protocol)) return `uses ${url.protocol}, which is not allowed`;
   if (url.protocol === "https:") return null;
-  if (url.protocol === "http:") return ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname) ? null : "uses plain http to another computer (use https)";
+  if (url.protocol === "http:") return LOOPBACK_HOSTS.has(url.hostname) ? null : "uses plain http to another computer (use https)";
   return /^[a-z][a-z0-9+.-]*:$/.test(url.protocol) ? null : "has a scheme that isn't allowed";
+}
+
+/**
+ * Whether a requested redirect_uri matches a registered one. Exact match
+ * everywhere except loopback http addresses (127.0.0.1, [::1], localhost),
+ * where RFC 8252 §7.3 (and Claude Code's metadata document) allow any
+ * ephemeral port when scheme, host, path and query match.
+ */
+export function redirectUriMatches(registered: string, requested: string): boolean {
+  if (registered === requested) return true;
+  let reg: URL;
+  let req: URL;
+  try {
+    reg = new URL(registered);
+    req = new URL(requested);
+  } catch {
+    return false;
+  }
+  if (reg.protocol !== "http:" || req.protocol !== "http:") return false;
+  if (!LOOPBACK_HOSTS.has(reg.hostname) || reg.hostname !== req.hostname) return false;
+  if (reg.hash || req.hash || reg.username || reg.password || req.username || req.password) return false;
+  return reg.pathname === req.pathname && reg.search === req.search;
 }
 
 function stringList(value: unknown): string[] | null {
@@ -152,7 +175,7 @@ function isTokenAuthMethod(value: unknown): value is AssistantTokenAuthMethod {
  * public client (`none`) gets no secret; a confidential one gets a secret
  * shown once here and kept only as its digest. PKCE is required either way.
  */
-export function registerClient(db: Db, body: unknown): OAuthAnswer {
+export async function registerClient(db: Db, body: unknown): Promise<OAuthAnswer> {
   if (typeof body !== "object" || body === null || Array.isArray(body)) return oauthError(400, "invalid_client_metadata", "Send the client's metadata as a JSON object.");
   const meta = body as Record<string, unknown>;
   const uris = stringList(meta.redirect_uris);
@@ -167,14 +190,14 @@ export function registerClient(db: Db, body: unknown): OAuthAnswer {
   if (grants.some((g) => g !== "authorization_code" && g !== "refresh_token")) return oauthError(400, "invalid_client_metadata", "Only authorization_code and refresh_token grants are offered.");
   const responseTypes = stringList(meta.response_types) ?? ["code"];
   if (responseTypes.some((t) => t !== "code")) return oauthError(400, "invalid_client_metadata", "Only the code response type is offered.");
-  if (db.countAssistantClients() >= MAX_REGISTERED_CLIENTS) {
+  if ((await db.countAssistantClients()) >= MAX_REGISTERED_CLIENTS) {
     console.error("[mutinybim-web] assistant registration refused: the client table is full", { max: MAX_REGISTERED_CLIENTS });
     return oauthError(503, "temporarily_unavailable", "Registration is full on this server right now. Try again later.");
   }
   const clientId = `mbc_${randomUUID()}`;
   const clientName = cleanName(meta.client_name, "An assistant");
   const secret = method === "none" ? null : randomToken("mbs_");
-  db.saveAssistantClient({ clientId, clientName, redirectUris: uris, kind: "registered", tokenAuthMethod: method, secretHash: secret ? digest(secret) : null });
+  await db.saveAssistantClient({ clientId, clientName, redirectUris: uris, kind: "registered", tokenAuthMethod: method, secretHash: secret ? digest(secret) : null });
   console.log("[mutinybim-web] an assistant registered", { clientId, clientName, tokenAuthMethod: method });
   return {
     status: 201,
@@ -216,13 +239,47 @@ export function metadataClientCanUseNone(meta: Record<string, unknown>): boolean
 
 const defaultResolve: ResolveHost = async (hostname) => (await lookup(hostname, { all: true })).map((a) => a.address);
 
+interface PinnedMetadataClient {
+  readonly clientName: string;
+  readonly redirectUris: readonly string[];
+}
+
+/**
+ * Known assistants whose metadata address may refuse this server's fetch.
+ * claude.ai's Cloudflare edge answers 403 to requests from some cloud hosting
+ * IPs, which would otherwise stop every Claude and Claude Code sign-in. An
+ * entry is used only in memory when the live fetch fails and nothing is kept
+ * from an earlier live fetch; a document that arrives always wins and is
+ * cached, and the pin is not written to the database so a future live fetch
+ * or pin update takes effect right away.
+ */
+const PINNED_METADATA_CLIENTS: ReadonlyMap<string, PinnedMetadataClient> = new Map([
+  ["https://claude.ai/oauth/mcp-oauth-client-metadata", { clientName: "Claude", redirectUris: ["https://claude.ai/api/mcp/auth_callback"] }],
+  ["https://claude.ai/oauth/claude-code-client-metadata", { clientName: "Claude Code", redirectUris: ["http://localhost/callback", "http://127.0.0.1/callback"] }],
+]);
+
+function pinnedMetadataClient(clientId: string): AssistantClientRow | null {
+  const pinned = PINNED_METADATA_CLIENTS.get(clientId);
+  if (!pinned) return null;
+  return {
+    client_id: clientId,
+    client_name: pinned.clientName,
+    redirect_uris: pinned.redirectUris,
+    kind: "metadata",
+    token_auth_method: "none",
+    secret_hash: null,
+    created_at: new Date().toISOString(),
+  };
+}
+
 /**
  * A client ID metadata document: the client_id is an https address the
  * assistant's maker publishes. Fetched only from public addresses, without
- * following redirects, small and quick, and kept for a day.
+ * following redirects, small and quick, and kept for a day. When the fetch
+ * fails, a copy kept from an earlier live fetch or a pinned entry stands in.
  */
 async function metadataClient(clientId: string, options: AssistantAuthOptions): Promise<AssistantClientRow | string> {
-  const cached = options.db.assistantClient(clientId);
+  const cached = await options.db.assistantClient(clientId);
   if (cached && Date.now() - Date.parse(cached.created_at) < METADATA_DOCUMENT_REFRESH_MS) return cached;
   let url: URL;
   try {
@@ -239,16 +296,29 @@ async function metadataClient(clientId: string, options: AssistantAuthOptions): 
     console.error("[mutinybim-web] an assistant's metadata address didn't resolve", { clientId, err });
     return "The assistant's client_id address couldn't be found.";
   }
+  // The maker's site didn't hand the document over (some refuse fetches from
+  // cloud hosting IPs): use the copy kept from an earlier live fetch, then
+  // the pinned entry for a known assistant, before giving up.
+  const unreachable = (problem: string): AssistantClientRow | string => {
+    if (cached) {
+      console.warn("[mutinybim-web] an assistant's metadata couldn't be refreshed; using the kept copy", { clientId, problem });
+      return cached;
+    }
+    const pinned = pinnedMetadataClient(clientId);
+    if (!pinned) return problem;
+    console.warn("[mutinybim-web] an assistant's metadata couldn't be fetched; using the pinned entry", { clientId, problem });
+    return pinned;
+  };
   let doc: unknown;
   try {
     const response = await (options.fetchImpl ?? fetch)(url.href, { redirect: "error", signal: AbortSignal.timeout(5_000), headers: { accept: "application/json" } });
-    if (!response.ok) return `The assistant's metadata answered ${response.status}.`;
+    if (!response.ok) return unreachable(`The assistant's metadata answered ${response.status}.`);
     const text = await response.text();
     if (text.length > METADATA_DOCUMENT_MAX_BYTES) return "The assistant's metadata is larger than 5 KB.";
     doc = JSON.parse(text);
   } catch (err) {
     console.error("[mutinybim-web] fetching an assistant's metadata failed", { clientId, err });
-    return "The assistant's metadata couldn't be read.";
+    return unreachable("The assistant's metadata couldn't be read.");
   }
   if (typeof doc !== "object" || doc === null) return "The assistant's metadata is not a JSON object.";
   const meta = doc as Record<string, unknown>;
@@ -260,8 +330,8 @@ async function metadataClient(clientId: string, options: AssistantAuthOptions): 
     return "This assistant can only sign in with a key this server doesn't check (it doesn't offer the public, no-secret sign-in).";
   }
   const clientName = cleanName(meta.client_name, url.hostname);
-  options.db.saveAssistantClient({ clientId, clientName, redirectUris: uris, kind: "metadata" });
-  const saved = options.db.assistantClient(clientId);
+  await options.db.saveAssistantClient({ clientId, clientName, redirectUris: uris, kind: "metadata" });
+  const saved = await options.db.assistantClient(clientId);
   return saved ?? "The assistant's metadata couldn't be kept.";
 }
 
@@ -314,11 +384,13 @@ export function errorRedirect(origin: string, redirectUri: string, state: string
 export async function checkAuthorize(params: URLSearchParams, options: AssistantAuthOptions): Promise<AuthorizeCheck> {
   const clientId = params.get("client_id") ?? "";
   if (!clientId) return { ok: false, show: "The assistant didn't say who it is (no client_id). Start connecting again from the assistant." };
-  const found = clientId.startsWith("https://") ? await metadataClient(clientId, options) : options.db.assistantClient(clientId);
+  const found = clientId.startsWith("https://") ? await metadataClient(clientId, options) : await options.db.assistantClient(clientId);
   if (typeof found === "string") return { ok: false, show: found };
   if (!found) return { ok: false, show: "This server doesn't know that assistant. Remove MutinyBIM from the assistant and add it again, so it registers afresh." };
   const redirectUri = params.get("redirect_uri") ?? (found.redirect_uris.length === 1 ? found.redirect_uris[0] ?? "" : "");
-  if (!found.redirect_uris.includes(redirectUri)) return { ok: false, show: "The assistant asked to send you back to an address it didn't register, so this was stopped." };
+  if (!redirectUri || redirectUriProblem(redirectUri) !== null || !found.redirect_uris.some((u) => redirectUriMatches(u, redirectUri))) {
+    return { ok: false, show: "The assistant asked to send you back to an address it didn't register, so this was stopped." };
+  }
   const state = params.get("state");
   const back = (error: string, description: string): AuthorizeCheck => ({ ok: false, redirect: errorRedirect(options.origin, redirectUri, state, error, description) });
   if (params.get("response_type") !== "code") return back("unsupported_response_type", "Only response_type=code is offered.");
@@ -332,9 +404,9 @@ export async function checkAuthorize(params: URLSearchParams, options: Assistant
 }
 
 /** After the person said yes: a one-time code, and the address that hands it to the assistant. */
-export function approveAuthorize(request: AuthorizeRequest, user: UserRow, options: AssistantAuthOptions): string {
+export async function approveAuthorize(request: AuthorizeRequest, user: UserRow, options: AssistantAuthOptions): Promise<string> {
   const code = randomToken("mbcode_");
-  options.db.saveAssistantCode(digest(code), { client_id: request.client.client_id, user_id: user.id, redirect_uri: request.redirectUri, code_challenge: request.codeChallenge, resource: request.resource, scope: request.scope }, new Date(Date.now() + CODE_MINUTES * 60_000));
+  await options.db.saveAssistantCode(digest(code), { client_id: request.client.client_id, user_id: user.id, redirect_uri: request.redirectUri, code_challenge: request.codeChallenge, resource: request.resource, scope: request.scope }, new Date(Date.now() + CODE_MINUTES * 60_000));
   console.log("[mutinybim-web] an assistant was let in", { userId: user.id, clientId: request.client.client_id });
   const url = new URL(request.redirectUri);
   url.searchParams.set("code", code);
@@ -381,7 +453,7 @@ function basicCredentials(authorization: string | undefined): { id: string; secr
  * client_id; a confidential client must also prove its secret, in the body
  * (`client_secret_post`) or in HTTP Basic (`client_secret_basic`), never both.
  */
-function authenticateClient(form: URLSearchParams, authorization: string | undefined, options: AssistantAuthOptions): { clientId: string } | OAuthAnswer {
+async function authenticateClient(form: URLSearchParams, authorization: string | undefined, options: AssistantAuthOptions): Promise<{ clientId: string } | OAuthAnswer> {
   const basic = basicCredentials(authorization);
   if (basic === "bad") return oauthError(401, "invalid_client", "The Basic credentials couldn't be read.");
   const formId = form.get("client_id");
@@ -391,7 +463,7 @@ function authenticateClient(form: URLSearchParams, authorization: string | undef
   const clientId = basic?.id ?? formId ?? "";
   if (!clientId) return oauthError(401, "invalid_client", "Send client_id (public clients authenticate with PKCE, not a secret).");
   const secret = basic?.secret ?? formSecret ?? "";
-  const client = options.db.assistantClient(clientId);
+  const client = await options.db.assistantClient(clientId);
   if (client && client.token_auth_method !== "none") {
     if (!secret || !client.secret_hash || !sameSecret(secret, client.secret_hash)) {
       console.warn("[mutinybim-web] an assistant's client secret was missing or wrong", { clientId, via: basic ? "basic" : formSecret ? "post" : "none" });
@@ -404,23 +476,23 @@ function authenticateClient(form: URLSearchParams, authorization: string | undef
 }
 
 /** The token endpoint: a code (with its PKCE verifier) or a refresh token, for new tokens. */
-export function exchangeToken(form: URLSearchParams, options: AssistantAuthOptions, authorization?: string): OAuthAnswer {
+export async function exchangeToken(form: URLSearchParams, options: AssistantAuthOptions, authorization?: string): Promise<OAuthAnswer> {
   const grantType = form.get("grant_type");
-  const caller = authenticateClient(form, authorization, options);
+  const caller = await authenticateClient(form, authorization, options);
   if ("status" in caller) return caller;
   const { clientId } = caller;
   if (grantType === "authorization_code") {
     const code = form.get("code") ?? "";
-    const found = code ? options.db.takeAssistantCode(digest(code)) : null;
+    const found = code ? await options.db.takeAssistantCode(digest(code)) : null;
     if (!found || found.client_id !== clientId) return oauthError(400, "invalid_grant", "That sign-in code is unknown, used or expired. Sign in again.");
     if ((form.get("redirect_uri") ?? found.redirect_uri) !== found.redirect_uri) return oauthError(400, "invalid_grant", "The redirect_uri doesn't match the sign-in.");
     const verifier = form.get("code_verifier") ?? "";
     if (!/^[A-Za-z0-9._~-]{43,128}$/.test(verifier) || s256(verifier) !== found.code_challenge) return oauthError(400, "invalid_grant", "The PKCE code_verifier doesn't match.");
     const resource = form.get("resource");
     if (resource !== null && canonicalResource(options.origin, options.families, resource) !== found.resource) return oauthError(400, "invalid_target", "The resource doesn't match the sign-in.");
-    const client = options.db.assistantClient(clientId);
+    const client = (await options.db.assistantClient(clientId)) ?? pinnedMetadataClient(clientId);
     const tokens = issueTokens();
-    options.db.createAssistantGrant({
+    await options.db.createAssistantGrant({
       id: randomUUID(),
       userId: found.user_id,
       clientId,
@@ -437,7 +509,7 @@ export function exchangeToken(form: URLSearchParams, options: AssistantAuthOptio
   if (grantType === "refresh_token") {
     const refresh = form.get("refresh_token") ?? "";
     const tokens = issueTokens();
-    const rotated = refresh ? options.db.rotateAssistantRefresh(digest(refresh), clientId, { accessHash: digest(tokens.access), accessExpiresAt: tokens.accessExpiresAt, refreshHash: digest(tokens.refresh), refreshExpiresAt: tokens.refreshExpiresAt }) : null;
+    const rotated = refresh ? await options.db.rotateAssistantRefresh(digest(refresh), clientId, { accessHash: digest(tokens.access), accessExpiresAt: tokens.accessExpiresAt, refreshHash: digest(tokens.refresh), refreshExpiresAt: tokens.refreshExpiresAt }) : null;
     if (rotated && "reused" in rotated) {
       console.warn("[mutinybim-web] a refresh token was used twice; the assistant's access was ended", { clientId });
       return oauthError(400, "invalid_grant", "That refresh token was already used, so this sign-in was ended. Sign in again.");
@@ -449,10 +521,10 @@ export function exchangeToken(form: URLSearchParams, options: AssistantAuthOptio
 }
 
 /** The person and grant behind a tool request's bearer token, when the token is valid for this tool server. */
-export function verifyAccessToken(authorization: string | undefined, options: AssistantAuthOptions): { readonly user: UserRow; readonly grantId: string; readonly clientName: string } | null {
+export async function verifyAccessToken(authorization: string | undefined, options: AssistantAuthOptions): Promise<{ readonly user: UserRow; readonly grantId: string; readonly clientName: string } | null> {
   const match = /^Bearer ([A-Za-z0-9_-]{20,200})$/.exec(authorization ?? "");
   if (!match?.[1]) return null;
-  const found = options.db.assistantGrantByAccess(digest(match[1]));
+  const found = await options.db.assistantGrantByAccess(digest(match[1]));
   if (!found) return null;
   // Audience: a token issued for any of this app's tool addresses (one server, several tool lists).
   if (canonicalResource(options.origin, options.families, found.grant.resource) !== found.grant.resource) return null;

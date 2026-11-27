@@ -5,14 +5,17 @@ import { elementsOfKind } from "../store";
 import type { BimElement, ElementId, Level, ModelState, ParamValue } from "../types";
 import { IFC_IMPORT_RULE_POINT, type ImportRuleContext, type ImportRuleDef } from "./rule-point";
 import { reverseClassMap } from "./reverse-map";
-import { importElementId } from "./rules";
-import type { IfcImportPlan, IfcImportReport, ImportClassLine, ImportGroup, ImportProduct, ImportSource } from "./types";
+import { joinRuns, partConnectorAt } from "./joins";
+import { importElementId, importedPartPortId } from "./rules";
+import type { IfcImportPlan, IfcImportReport, ImportClassLine, ImportGroup, ImportJoin, ImportPort, ImportProduct, ImportSource } from "./types";
 
 /**
  * Plan an import (round 9 I9): every product of a linked model asks the
  * reverse class map for its class and that class's rule; what converts
  * becomes new records carrying `provenance`, what doesn't stays on the
- * linked model with its reason. Pure: reads `model` (Main's head, for levels
+ * linked model with its reason. The joins the file states between converted
+ * records are then made on both sides (`joins.ts`), and the ones that can't
+ * be are listed in the report. Pure: reads `model` (Main's head, for levels
  * and ids) and the pack set bound to it, writes nothing. The model server
  * lands the plan on a new branch (`import_elements`).
  */
@@ -31,6 +34,10 @@ export interface PlanImportOptions {
 }
 
 const LEVEL_MATCH_MM = 50;
+/** Group names a report note spells out before "and N more". */
+const GROUP_NAMES_SHOWN = 5;
+/** A group name longer than this is cut short in the note, so one name can't fill the report. */
+const GROUP_NAME_MAX = 80;
 
 /** "2 walls", "1 air terminal", "1 floor or slab": the label's nouns counted (registry labels are mostly plural, some singular). */
 function plural(n: number, label: string): string {
@@ -68,9 +75,23 @@ function planInScope(source: ImportSource, opts: PlanImportOptions): IfcImportPl
   const notes = new Set<string>();
   const shared = new Map<string, BimElement | string>();
   const exists = (id: ElementId) => byId.has(id) || opts.model.elements[id] !== undefined;
+  /** Source ids a planned record says it came from (a product's, a group's). */
+  const sourced = new Set<string>();
   const push = (r: BimElement) => {
     if (exists(r.id)) throw new Error(`[bim-kernel/import] the planned id ${r.id} is already used; the import key must be unique per source`);
     records.push(r);
+    byId.set(r.id, r);
+    const from = "provenance" in r ? r.provenance?.ifcGlobalId : undefined;
+    if (from) sourced.add(from);
+  };
+  // Where each planned record is, worked out on the first replacement (a file with no joins never builds it).
+  let placeOf: Map<string, number> | null = null;
+  /** A planned record with a link added or taken off, in the place of the one with its id. */
+  const replace = (r: BimElement) => {
+    placeOf ??= new Map(records.map((have, i) => [have.id, i]));
+    const at = placeOf.get(r.id);
+    if (at === undefined) throw new Error(`[bim-kernel/import] ${r.id} isn't a planned record, so it can't be replaced`);
+    records[at] = r;
     byId.set(r.id, r);
   };
 
@@ -97,7 +118,7 @@ function planInScope(source: ImportSource, opts: PlanImportOptions): IfcImportPl
       version: 0,
       authoredRev: {},
       name,
-      elevationMm: Math.round(storey.elevationMm),
+      elevationMm: Math.round(storey.elevationMm * 10) / 10,
       source: { referenceId: opts.referenceId, storeyId: storey.sourceId, storeyName: storey.name },
     };
     push(level);
@@ -117,7 +138,40 @@ function planInScope(source: ImportSource, opts: PlanImportOptions): IfcImportPl
   };
 
   const groups = new Map<string, ImportGroup>(source.groups.map((g) => [g.sourceId, g]));
-  const lines = new Map<string, { classId: string | null; label: string; converted: number; linked: Map<string, number> }>();
+  // Connection points by id, read once on the first join asked for (a file with no joins never builds it).
+  let pointOwners: Map<string, ImportJoin> | null = null;
+  const joinedTo = (port: ImportPort): readonly ImportJoin[] => {
+    if (port.connectedTo.length === 0) return [];
+    if (!pointOwners) {
+      pointOwners = new Map();
+      for (const product of source.products) for (const own of product.ports) pointOwners.set(own.id, { product, port: own });
+    }
+    const owners = pointOwners;
+    return port.connectedTo.flatMap((id) => {
+      const far = owners.get(id);
+      if (!far) return [];
+      // A part's connectors have ids of their own: match by source port id first (handles co-located ports), falling back to position for add-on part rules.
+      const record = convertedRecord(far.product.sourceId);
+      if (record?.kind !== "part") return [far];
+      const known = importedPartPortId(joinedTo, far.product.sourceId, far.port.id);
+      if (known !== undefined) return [{ ...far, connector: known }];
+      const type = planned(record.typeId);
+      const level = planned(record.levelId);
+      const at = far.port.position;
+      const found = at && type?.kind === "part_type" ? partConnectorAt(record, type, level?.kind === "level" ? level.elevationMm : 0, at, opts.model.settings.connectorToleranceMm) : null;
+      return [{ ...far, connector: found?.connector.id ?? null }];
+    });
+  };
+  /** A record of the plan as it stands, or one the model already has (a level a storey matched). */
+  const planned = (id: ElementId): BimElement | undefined => byId.get(id) ?? opts.model.elements[id];
+  const convertedRecord = (sourceId: string): BimElement | null => {
+    const id = converted.get(sourceId);
+    return id ? (byId.get(id) ?? null) : null;
+  };
+  const note = (text: string) => {
+    if (notes.size < 200) notes.add(text);
+  };
+  const lines =new Map<string, { classId: string | null; label: string; converted: number; linked: Map<string, number> }>();
   const line = (key: string, classId: string | null, label: string) => {
     let l = lines.get(key);
     if (!l) {
@@ -148,10 +202,8 @@ function planInScope(source: ImportSource, opts: PlanImportOptions): IfcImportPl
       idFor: (sourceId, suffix) => importElementId(opts.sourceKey, sourceId, suffix),
       level: levelFor,
       partition: (level) => ({ level: level.name, zone: "Z1", discipline: cls.discipline }),
-      converted: (sourceId) => {
-        const id = converted.get(sourceId);
-        return id ? (byId.get(id) ?? null) : null;
-      },
+      converted: convertedRecord,
+      joinedTo,
       group: (sourceId) => groups.get(sourceId) ?? null,
       shared: <T extends BimElement>(key: string, make: () => T | string): T | string => {
         const have = shared.get(key);
@@ -163,9 +215,7 @@ function planInScope(source: ImportSource, opts: PlanImportOptions): IfcImportPl
       },
       values: (p) => mappedValues(registry, cls.id, p),
       provenance: (p) => ({ ifcGlobalId: p.sourceId, source: source.id }),
-      note: (text) => {
-        if (notes.size < 200) notes.add(text);
-      },
+      note,
     };
     let result;
     try {
@@ -183,7 +233,29 @@ function planInScope(source: ImportSource, opts: PlanImportOptions): IfcImportPl
     if (own) converted.set(product.sourceId, own.id);
     line(cls.id, cls.id, cls.label).converted += 1;
   }
-  for (const u of source.unreadable) stay(u.entity, null, entityWords(u.entity), u.reason, u.count);
+  joinRuns({ source, record: planned, replace, converted: convertedRecord, joinedTo, level: levelFor, note, toleranceMm: opts.model.settings.connectorToleranceMm });
+  for (const u of source.unreadable) {
+    const match = u.classHint && map.choose({ entity: u.entity, ...u.classHint });
+    const cls = match?.ok ? match.choice.cls : match?.cls;
+    stay(cls?.id ?? u.entity, cls?.id ?? null, cls?.label ?? entityWords(u.entity), u.reason, u.count);
+  }
+
+  // Groups a class takes that no record came from: one note per class, ahead of the per-product notes, so what the file grouped isn't lost silently.
+  const leftGroups = new Map<string, { label: string; names: string[] }>();
+  for (const group of source.groups) {
+    if (sourced.has(group.sourceId)) continue;
+    const cls = map.candidates(group)[0];
+    if (!cls) continue;
+    const left = leftGroups.get(cls.id) ?? { label: cls.label, names: [] };
+    const name = group.name?.trim() || "unnamed";
+    left.names.push(name.length > GROUP_NAME_MAX ? `${name.slice(0, GROUP_NAME_MAX - 1).trimEnd()}…` : name);
+    leftGroups.set(cls.id, left);
+  }
+  const groupNotes = [...leftGroups.values()].map(({ label, names }) => {
+    const one = names.length === 1;
+    const shown = names.length > GROUP_NAMES_SHOWN ? [...names.slice(0, GROUP_NAMES_SHOWN), `${names.length - GROUP_NAMES_SHOWN} more`] : names;
+    return `${plural(names.length, label)} ${one ? "wasn't" : "weren't"} brought in (${list(shown)}); anything in ${one ? "it" : "them"} that converted came in on its own, so set ${one ? "it" : "them"} up again by hand`;
+  });
 
   const classes: ImportClassLine[] = [...lines.values()]
     .map((l) => ({ classId: l.classId, label: l.label, converted: l.converted, linked: [...l.linked].map(([reason, count]) => ({ reason, count })).sort((a, b) => b.count - a.count) }))
@@ -199,7 +271,7 @@ function planInScope(source: ImportSource, opts: PlanImportOptions): IfcImportPl
     stayLinked: linkedCount,
     levelsAdded,
     classes,
-    notes: [...notes],
+    notes: [...groupNotes, ...notes],
     summary,
   };
   return { records, converted, report };

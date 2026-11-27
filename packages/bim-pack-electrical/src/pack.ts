@@ -9,11 +9,12 @@
  * `bim-pack` reads lint, and the lint rules read this package, so a runtime
  * import of `bim-pack` here would load this file half-initialised.
  */
-import { ELECTRICAL_COMPONENTS } from "./annotation/electrical-symbols";
+import { ELECTRICAL_COMPONENTS, ELECTRICAL_PLAN_SYMBOLS } from "./annotation/electrical-symbols";
 import { TAG_STYLE_PRESET_POINT, BLOCK_DEPENDENCY_POINT, BLOCK_HOP_POINT, SERVICE_HOP, type BlockDependencyDef, type BlockHopDef, catalogElementId, linkServing, loadAnchorOf, loadIndexOf, FORM_SCHEDULE_POINT, type BimElement, type ElementId, type PartInstance, SYMBOL_POINT, symbolOfComponent, COMMAND_POINT, type PackCommandDef, refuse, POSITION_POLICY_POINT, NETWORK_ADAPTER_POINT, CATALOG_ENTRY_POINT, CONNECTION_FIELD_POINT, DIAGRAM_LAYOUT_POINT, VIEW_GRAPHICS_POINT, LOAD_SECTION_POINT, type NetworkAdapterItem, DIAGRAM_GRAPH_POINT, type DiagramGraphDef, FIELD_PROVIDER_POINT, type FieldProviderRow, FIELD_RESOLVER_POINT, DEDICATED_SPACE_RULE, DERIVED_ZONE_RULE_POINT, type DerivedZoneRuleDef, BUILTIN_LIBRARY_VERSION, PART_TYPE_POINT, type BuiltinPartTypeRow } from "@permitzip/bim-kernel";
 import { distributionOf, electricalConnectorIds } from "./connections/systems";
 import { ELECTRICAL_CATALOG_ROWS, ELECTRICAL_CONNECTION_FIELDS, feederTypeScheduleRecords } from "./catalog";
 import { ONE_LINE_LAYOUT_ROW } from "./diagrams/one-line-layout";
+import { CONTROLS_DIAGRAM_GRAPH, CONTROLS_DIAGRAM_LAYOUT_ROW } from "./diagrams/controls-diagram";
 import { CIRCUIT_GRAPHICS_ROW } from "./annotation/circuit-graphics";
 import { ELECTRICAL_LOAD_SECTION } from "./facets";
 import { electricalSourcesFor } from "./connections/sources";
@@ -29,9 +30,9 @@ import { LINK_TYPE_CATALOG_POINT, type LinkTypeCatalogRow } from "./fields/feede
 import { ELECTRICAL_FIELD_RESOLVER } from "./fields/electrical-resolver";
 import { ELECTRICAL_FIELD_PROVIDER } from "./fields/providers/electrical";
 import { AGENT_TOOL_POINT, PACK_READ_POINT, contribute, definePack, type ErasedContribution, type Pack, ELECTRICAL_MANIFEST } from "@permitzip/bim-kernel/packs";
-import { DISCIPLINE_POINT, MEASURE_RULE_POINT, PROPOSER_POINT, SERVICE_POINT } from "@permitzip/bim-kernel";
+import { DISCIPLINE_POINT, MEASURE_RULE_POINT, PROPOSER_POINT, SERVICE_LINE_CODE_POINT, SERVICE_POINT } from "@permitzip/bim-kernel";
 import { ELECTRICAL_PLANNED_ROW_FACTS } from "./planned-row-facts";
-import { ELECTRICAL_SERVICE_ROWS } from "./services/rows";
+import { ELECTRICAL_SERVICE_LINE_CODES, ELECTRICAL_SERVICE_ROWS } from "./services/rows";
 import { ELECTRICAL_DISCIPLINES } from "./disciplines";
 import { RECEPTACLE_PROPOSER } from "./propose/proposer";
 import { ELECTRICAL_MEASURE_RULE } from "./measure";
@@ -46,8 +47,51 @@ import { ELECTRICAL_LINT_RULES } from "./lint";
 import { LINT_RULE_POINT } from "@permitzip/bim-lint";
 import { electricalConnect } from "./circuiting/connect";
 import { ELECTRICAL_SCHEDULE_TEMPLATES } from "./schedules/list-templates";
+import { ELECTRICAL_CLASSES } from "./classes";
+import { CLASS_POINT } from "@permitzip/bim-pack/runtime";
 import { ELECTRICAL_KEYNOTE_TABLES } from "./keynotes";
-import { LIBRARY_ROWS_POINT } from "@permitzip/bim-kernel";
+import { LIBRARY_ROWS_POINT, PARAMETER_SET_POINT, type PackParameterSet } from "@permitzip/bim-kernel";
+import { ELECTRICAL_PHOTOMETRICS_PARAMETER_SET, PHOTOMETRIC_GRID_ROW } from "./photometrics";
+
+const DISCONNECT_PARAM_CLASSES = [
+  "mep.equipment",
+  "mep.plumbing_fixture",
+  "mep.air_terminal",
+  "mep.electrical_device",
+  "mep.lighting_fixture",
+  "gen.generic_model",
+] as const;
+
+export const ELECTRICAL_DISCONNECT_PARAMETER_SET: PackParameterSet = {
+  id: "electrical.disconnect",
+  label: "Electrical local disconnect",
+  parameters: [
+    {
+      key: "electrical.disconnect_required",
+      label: "Local disconnect required",
+      classes: DISCONNECT_PARAM_CLASSES,
+      valueType: "boolean",
+      group: "Electrical",
+      description: "Whether NEC 440.14 / 430.102 requires a local disconnect switch for this equipment.",
+    },
+    {
+      key: "electrical.local_disconnect",
+      label: "Local disconnect status",
+      classes: DISCONNECT_PARAM_CLASSES,
+      valueType: "text",
+      group: "Electrical",
+      description: "Local disconnect requirement state ('required' or 'not_required').",
+    },
+    {
+      key: "electrical.disconnect_note",
+      label: "Local disconnect note",
+      classes: DISCONNECT_PARAM_CLASSES,
+      valueType: "text",
+      group: "Electrical",
+      description: "Optional code exemption or equipment disconnect note (e.g. factory integral disconnect).",
+    },
+  ],
+};
 
 const [serviceLayoutSchema] = serviceLayoutCommandSchemas;
 
@@ -192,20 +236,23 @@ const PART_TYPES: readonly BuiltinPartTypeRow[] = [
 /** This pack's contributions: the wave-1 kernel rows in their order, then the demand rule sets, calcs, part types, lint rules and agent tools. */
 export const ELECTRICAL_CONTRIBUTIONS: readonly ErasedContribution[] = [
   contribute(DISCIPLINE_POINT, ELECTRICAL_DISCIPLINES),
+  contribute(CLASS_POINT, ELECTRICAL_CLASSES),
+  contribute(PARAMETER_SET_POINT, [ELECTRICAL_PHOTOMETRICS_PARAMETER_SET, ELECTRICAL_DISCONNECT_PARAMETER_SET]),
   contribute(COMMAND_POINT, [SERVICE_LAYOUT_COMMAND]),
   contribute(NETWORK_ADAPTER_POINT, [ADAPTER]),
   contribute(DERIVED_ZONE_RULE_POINT, [DEDICATED_SPACE]),
   contribute(LINK_TYPE_CATALOG_POINT, [FEEDER_TYPES]),
   contribute(CATALOG_ENTRY_POINT, ELECTRICAL_CATALOG_ROWS),
   contribute(CONNECTION_FIELD_POINT, ELECTRICAL_CONNECTION_FIELDS),
-  contribute(DIAGRAM_LAYOUT_POINT, [ONE_LINE_LAYOUT_ROW]),
-  contribute(VIEW_GRAPHICS_POINT, [CIRCUIT_GRAPHICS_ROW]),
+  contribute(DIAGRAM_LAYOUT_POINT, [ONE_LINE_LAYOUT_ROW, CONTROLS_DIAGRAM_LAYOUT_ROW]),
+  contribute(VIEW_GRAPHICS_POINT, [CIRCUIT_GRAPHICS_ROW, PHOTOMETRIC_GRID_ROW]),
   contribute(LOAD_SECTION_POINT, [ELECTRICAL_LOAD_SECTION]),
   contribute(SERVICE_POINT, ELECTRICAL_SERVICE_ROWS),
+  contribute(SERVICE_LINE_CODE_POINT, ELECTRICAL_SERVICE_LINE_CODES),
   contribute(DESIGN_LIMIT_DEFAULT_POINT, ELECTRICAL_DESIGN_LIMIT_DEFAULTS),
   contribute(FIELD_PROVIDER_POINT, [FIELDS]),
-  contribute(DIAGRAM_GRAPH_POINT, [ONE_LINE, RISER]),
-  contribute(SYMBOL_POINT, ELECTRICAL_COMPONENTS.map(symbolOfComponent)),
+  contribute(DIAGRAM_GRAPH_POINT, [ONE_LINE, RISER, CONTROLS_DIAGRAM_GRAPH]),
+  contribute(SYMBOL_POINT, [...ELECTRICAL_COMPONENTS.map(symbolOfComponent), ...ELECTRICAL_PLAN_SYMBOLS]),
   contribute(BLOCK_HOP_POINT, [SERVICE_HOP_ROW]),
   contribute(BLOCK_DEPENDENCY_POINT, [DISTRIBUTION_DEPS]),
   contribute(FORM_SCHEDULE_POINT, DISTRIBUTION_FORM_ROWS),

@@ -60,13 +60,13 @@ const STORED_OWNERS: Readonly<Record<StoredNameKind, ReadonlyMap<string, FirstPa
   command: new Map([["place_service_layout", E], ["name_stacks", P], ["edit_stack", P], ["delete_stacks", P], ["set_stack_checks", P], ["set_run_insulation", M], ["set_pipe_insulation", M], ["set_terminal_cfm", M]]),
   /** Kernel commands whose case for a kind a first-party add-on owns (`PackCommandDef.claims`): refused naming it when it isn't loaded. */
   claim: new Map([["slide_branch", M], ["resize_run", M], ["move_equipment", M]]),
-  diagram: new Map([["one_line", E], ["electrical_riser", E], ["plumbing_riser", P], ["plumbing_isometric", P], ["air_schematic", M]]),
-  form: new Map([["panel", E], ["switchboard", E], ["feeder", E], ["connection_types", E], ["equipment_connections", E], ["gas_equipment", P], ["gas_connections", P]]),
+  diagram: new Map([["one_line", E], ["electrical_riser", E], ["controls_diagram", E], ["plumbing_riser", P], ["plumbing_isometric", P], ["air_schematic", M]]),
+  form: new Map([["panel", E], ["switchboard", E], ["feeder", E], ["connection_types", E], ["equipment_connections", E], ["lighting_controls", E], ["photometric_summary", E], ["egress_lighting_compliance", E], ["gas_equipment", P], ["gas_connections", P]]),
   table: new Map([["ventilation", M], ["pressurization", M], ["gas", P]]),
   /** Built-in pipe materials whose products (sizes, joints) a first-party add-on supplies. */
   pipe_material: new Map(["copper", "pex", "cpvc", "cast_iron", "pvc", "abs", "steel", "black_steel", "galvanized", "pp_r", "csst", "pe"].map((m) => [m, P])),
   /** Stored catalog record types (`CATALOG_ENTRY_POINT`) a first-party add-on registers (round 12, E12). */
-  catalog: new Map([["feeder_type", E], ["circuit_template", E], ["pipe_type", P], ["plumbing_settings", P]]),
+  catalog: new Map([["feeder_type", E], ["circuit_template", E], ["photometric_profile", E], ["pipe_type", P], ["plumbing_settings", P]]),
   /** Stored fitting family ids by their first word (`pipe.…`): the kernel draws no pipe family of its own (round 12). */
   fitting_family: new Map([["pipe", P]]),
 };

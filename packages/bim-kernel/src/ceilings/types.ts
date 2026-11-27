@@ -16,6 +16,13 @@ import type { ElementCore, ElementId, ModelElementBase, Vec2 } from "../types";
 /** Peers read and store `ceiling` records. */
 export const CEILINGS_FEATURE = "elements:ceilings";
 
+/** The most corners a ceiling's outline, or one of its holes, can have. */
+export const CEILING_OUTLINE_MAX_POINTS = 2000;
+/** The most holes a ceiling can have. */
+export const CEILING_HOLES_MAX = 200;
+/** The greatest height above its level a ceiling can have, mm (about 330 ft). */
+export const CEILING_HEIGHT_MAX_MM = 100_000;
+
 export const KNOWN_CEILING_FORMS = ["flat", "sloped", "cloud", "soffit", "open_to_structure"] as const;
 export type CeilingForm = (typeof KNOWN_CEILING_FORMS)[number] | (string & {});
 
@@ -23,6 +30,18 @@ export type CeilingForm = (typeof KNOWN_CEILING_FORMS)[number] | (string & {});
 export interface CeilingSlope {
   readonly directionDeg: number;
   readonly pitch: number;
+}
+
+/** A ceiling tile grid: exact real-scale tile dimensions, origin, and rotation in model coordinates (mm). */
+export interface CeilingGrid {
+  /** Tile width along the grid's local X axis, mm (e.g. 1219.2 for 4', 609.6 for 2'). */
+  readonly spacingXMm: number;
+  /** Tile depth along the grid's local Y axis, mm (e.g. 609.6 for 2'). */
+  readonly spacingYMm: number;
+  /** Grid origin in model XY, mm (defaults to { x: 0, y: 0 }). */
+  readonly origin?: Vec2;
+  /** Grid rotation counter-clockwise from east, degrees (default 0; 90 rotates 2×4 tiles north-south). */
+  readonly rotationDeg?: number;
 }
 
 export interface Ceiling extends ModelElementBase, ElementCore {
@@ -43,6 +62,8 @@ export interface Ceiling extends ModelElementBase, ElementCore {
   readonly slope?: CeilingSlope;
   /** Its surface role (`SURFACE_ROLE_POINT`). Absent: `ceiling`. */
   readonly role?: string;
+  /** Optional explicit tile grid (spacing, origin, rotation) for ACT/grid ceilings; absent derives from material hatch. */
+  readonly grid?: CeilingGrid;
 }
 
 /**

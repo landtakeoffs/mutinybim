@@ -4,13 +4,14 @@ import { finish, guard, refuse, type AuthoredWrite, type ExecuteResult } from ".
 import { REGISTRY_ID_MAX_LENGTH, REGISTRY_ID_PATTERN } from "../ids";
 import { TrackedReader } from "../model";
 import { activeClassRegistry } from "../registry";
-import { cleanOutline, containsPoint, outlineAreaMm2, outlineProblem, MM2_PER_M2 } from "../spaces/space-geometry";
+import { outlineAreaMm2, outlineProblem, MM2_PER_M2 } from "../spaces/space-geometry";
 import { draftElements } from "../store";
 import { asElementId, type BimElement, type ElementId, type Level, type ModelState, type Partition, type Vec2 } from "../types";
 import { CEILING_CLASS_ID, CEILINGS_NOT_YET, ceilingsWritable } from "./feature";
+import { checkCeilingHole, checkCeilingOutline } from "./outline";
 import { ceilingForm, ceilingLabel, ceilingSlope, defaultRoleForForm, isCeiling, surfaceRoles } from "./read";
 import { ceilingStructureProblem, ftIn } from "./structure";
-import { KNOWN_CEILING_FORMS, type Ceiling, type CeilingForm, type CeilingSlope } from "./types";
+import { CEILING_HEIGHT_MAX_MM, CEILING_HOLES_MAX, CEILING_OUTLINE_MAX_POINTS, KNOWN_CEILING_FORMS, type Ceiling, type CeilingForm, type CeilingGrid, type CeilingSlope } from "./types";
 
 /**
  * Ceiling edits: the one path the ceiling plan's Ceiling tool, "Make a
@@ -24,15 +25,23 @@ import { KNOWN_CEILING_FORMS, type Ceiling, type CeilingForm, type CeilingSlope 
 
 const id = z.string().trim().min(1).max(200);
 const vec2 = z.object({ x: z.number().finite().min(-1e9).max(1e9), y: z.number().finite().min(-1e9).max(1e9) }).strict();
-const outline = z.array(vec2).min(3).max(2000);
+const outline = z.array(vec2).min(3).max(CEILING_OUTLINE_MAX_POINTS);
 /** Heights above the level, mm (up to about 330 ft). */
-const heightMm = z.number().finite().positive().max(100_000);
+const heightMm = z.number().finite().positive().max(CEILING_HEIGHT_MAX_MM);
 const slope = z
   .object({
     /** Degrees counter-clockwise from east: the direction the plane rises toward. */
     directionDeg: z.number().finite().min(-3600).max(3600),
     /** Rise over run (0.25 is 3 in 12). */
     pitch: z.number().finite().min(-10).max(10).refine((p) => p !== 0, "A slope needs a pitch; a flat ceiling has no slope"),
+  })
+  .strict();
+const grid = z
+  .object({
+    spacingXMm: z.number().finite().positive().max(20_000),
+    spacingYMm: z.number().finite().positive().max(20_000),
+    origin: vec2.optional(),
+    rotationDeg: z.number().finite().min(-3600).max(3600).optional(),
   })
   .strict();
 const registryId = z.string().max(REGISTRY_ID_MAX_LENGTH).regex(REGISTRY_ID_PATTERN, "an id such as ceiling or zz.baffle");
@@ -47,7 +56,7 @@ const ceilingInput = z
     /** The space it is hosted in. Absent: in none (a canopy, an open area). */
     spaceId: id.optional(),
     outline,
-    holes: z.array(outline).max(200).optional(),
+    holes: z.array(outline).max(CEILING_HOLES_MAX).optional(),
     /** Absent: sloped when a slope is given, else flat. */
     form: form.optional(),
     heightMm,
@@ -59,6 +68,8 @@ const ceilingInput = z
     classId: registryId.optional(),
     /** An element type (what it is made of). */
     typeId: id.optional(),
+    /** Optional explicit tile grid (spacing, origin, rotation) in mm. */
+    grid: grid.optional(),
   })
   .strict();
 
@@ -73,7 +84,7 @@ export const ceilingCommandSchemas = [
       spaceId: id.nullable().optional(),
       outline: outline.optional(),
       /** `null` (or an empty list) removes every hole. */
-      holes: z.array(outline).max(200).nullable().optional(),
+      holes: z.array(outline).max(CEILING_HOLES_MAX).nullable().optional(),
       form: form.optional(),
       heightMm: heightMm.optional(),
       reference: vec2.nullable().optional(),
@@ -84,6 +95,8 @@ export const ceilingCommandSchemas = [
       classId: registryId.optional(),
       /** `null` clears the type. */
       typeId: id.nullable().optional(),
+      /** `null` clears the explicit tile grid (falls back to material hatch). */
+      grid: grid.nullable().optional(),
     })
     .strict(),
   z.object({ type: z.literal("delete_ceilings"), ceilingIds: z.array(id).min(1).max(500) }).strict(),
@@ -172,8 +185,8 @@ function requireSpaceOn(e: Edit, spaceId: string, levelId: ElementId): ElementId
 }
 
 function cleanedOutline(points: readonly Vec2[], what: string): Vec2[] {
-  const o = cleanOutline(points);
-  const problem = outlineProblem(o);
+  const { outline: o, fault } = checkCeilingOutline(points);
+  const problem = fault ? outlineProblem(o) : null;
   if (problem) refuse("invalid_value", problem.replace(/^A space needs/, `A ${what} needs`).replace("around the space", `around the ${what}`).replace("encloses almost no floor", "covers almost nothing"));
   return o;
 }
@@ -182,7 +195,7 @@ function cleanedHoles(holes: readonly (readonly Vec2[])[] | null | undefined, ar
   const out: Vec2[][] = [];
   for (const h of holes ?? []) {
     const hole = cleanedOutline(h, "hole");
-    if (!hole.every((p) => containsPoint(around, p))) refuse("invalid_value", "A hole must sit inside the ceiling's outline. Draw the opening within it, or redraw the outline around it");
+    if (checkCeilingHole(hole, around).fault === "outside") refuse("invalid_value", "A hole must sit inside the ceiling's outline. Draw the opening within it, or redraw the outline around it");
     out.push(hole);
   }
   return out;
@@ -270,6 +283,7 @@ export function newCeiling(e: Edit, input: CeilingInput): Ceiling {
     ...(input.reference ? { reference: input.reference } : {}),
     ...(s ? { slope: s } : {}),
     ...(role !== undefined && role !== defaultRoleForForm(f) ? { role } : {}),
+    ...(input.grid ? { grid: input.grid } : {}),
   };
 }
 
@@ -323,7 +337,8 @@ function editCeiling(model: ModelState, command: Extract<CeilingCommand, { type:
   const role = command.role === null ? undefined : command.role !== undefined ? requireRole(command.role) : c.role;
   const reference = keep(command.reference, c.reference);
   const typeId = command.typeId === null ? undefined : command.typeId !== undefined ? requireType(e, command.typeId) : c.typeId;
-  const { spaceId: _s, holes: _h, slope: _sl, role: _r, reference: _ref, typeId: _t, classSource: priorClassSource, ...base } = c;
+  const nextGrid: CeilingGrid | undefined = keep(command.grid, c.grid);
+  const { spaceId: _s, holes: _h, slope: _sl, role: _r, reference: _ref, typeId: _t, grid: _g, classSource: priorClassSource, ...base } = c;
   // A class set by hand is the person's own, no longer the recognised one.
   const classSource = command.classId !== undefined ? undefined : priorClassSource;
   const next: Ceiling = {
@@ -340,6 +355,7 @@ function editCeiling(model: ModelState, command: Extract<CeilingCommand, { type:
     ...(reference ? { reference } : {}),
     ...(s ? { slope: s } : {}),
     ...(role !== undefined && role !== defaultRoleForForm(f) ? { role } : {}),
+    ...(nextGrid ? { grid: nextGrid } : {}),
   };
   if (ceilingFingerprint(next) === ceilingFingerprint(c)) refuse("invalid_value", `Nothing to change: ${ceilingLabel(c)} already reads that way`, [c.id]);
   put(e, next);

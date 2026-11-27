@@ -10,18 +10,37 @@ import { FragmentsModels, type FragmentsModel } from "@thatopen/fragments";
 import { asElementId, elementEntries, type Aabb3, type CropBox3d, type CropFace, type DisplayContext, type ElementId, type ModelState, type RouteJoin, type View3dCamera, findLevelByName, normalizeLevelName } from "@permitzip/bim-kernel";
 import { liveDisplayOf, liveViewRangeExcludes, type CategoryView } from "./live-display";
 import { livePlanSymbols, symbolPositions, type LivePlanText } from "./live-plan-graphics";
+import { buildScalarHeatmapGroup, type ScalarHeatmapOverlay } from "./scalar-heatmap";
+import { SceneLightingController, type SceneLightEmitter, type SceneLightingPreset } from "./scene-lighting";
 import { PlanFootprintGrid } from "./plan-near-miss";
 import { ifcPlacementToScene, kernelToScene, MM, sceneToKernel, toColumnMajor, type Mat4Rows, type Vec3Tuple } from "./coords";
 import { robustCore } from "./framing";
 import { DEFAULT_ELEVATIONS, modelSolids, routeJoinSolids, type ElevationRules, type RenderGroup, type Solid } from "./native-geometry";
 import { batchMeshSolids, batchOwnerAt, type MeshBatch } from "./mesh-batches";
+import { applyCeilingGridUVs, buildStudioEnvironment, cleanEdgesGeometry, disposeEnvironmentTexture, ensureBoxUVs, inflateAlongNormals, proceduralMaterialMaps } from "./procedural-textures";
+import { materialOf, parseHexColor, type MaterialPattern } from "@permitzip/bim-kernel";
 import { readReferenceItem, type ReferenceItemProperties } from "./item-properties";
 import { nearestTurn, type Orientation, type PlanRectMm } from "./orientation";
 import { screenBoxes, type ScreenRect } from "./box-select";
-import { ARROW_PX, buildArrows, chooseOrbitPivot, gizmoHandleAt, gizmoScreen, metresPerPixel, planUpVector, pointOnScreen, type GizmoHandle, type GizmoScreen } from "./origin-gizmo";
+import {
+  ARROW_PX,
+  buildArrows,
+  buildDepthAwareAxisLines,
+  chooseOrbitPivot,
+  gizmoHandleAt,
+  gizmoScreen,
+  metresPerPixel,
+  planUpVector,
+  pointOnScreen,
+  updateDepthAwareAxisLines,
+  type GizmoHandle,
+  type GizmoScreen,
+} from "./origin-gizmo";
 import { ViewerPalette, type ViewerColors } from "./viewer-colors";
 import { matchCamera, orthoZoomFor, type Projection, type ViewCamera } from "./projection";
 import { makeCameraControls, pinOrbitPoint, zoomFloorFor, type PointZoomControls, type ZoomAnchorQuery } from "./navigation";
+import { releaseWalkOnBlur, WALK_SPEED_SCALE_MAX, WALK_SPEED_SCALE_MIN, WALK_SPEED_WHEEL_LOG_STEP, WalkMotion } from "./walk";
+import { walkKeyOf } from "./walk-keys";
 import { NORMAL_REFERENCE_TONE, PICK_HIGHLIGHT_ID, baseMaterials, overlayMaterial, referenceMayWinPick, sameReferenceTone, toneMaterial, type ReferenceTone } from "./reference-tone";
 import { NO_INSETS, planFit, type FrameInsets } from "./plan-fit";
 import { CropBoxOutline, cropBoxScenePlanes, faceDragOffsetMm, gripsOnScreen, keptByPlanes, type GripOnScreen } from "./crop-box";
@@ -30,6 +49,22 @@ import { solidRotation } from "./solid-pose";
 import { nativeHiddenByLinked } from "./hover-occlusion";
 
 export type ViewMode = "3d" | "plan";
+
+/**
+ * Exclusive owner of 3D camera navigation (keyboard walk, floor-walk,
+ * route-follow, waypoint flyover, or a host-provided mode). Claiming a new
+ * mode calls `stop()` on the previous owner so two navigation modes never
+ * compete for camera controls, Escape, or projection.
+ */
+export interface CameraModeClaim {
+  readonly id: string;
+  readonly stop: () => void;
+}
+
+/** A frame longer than this (seconds) counts as one this long for a walk step. */
+const WALK_MAX_FRAME_SECONDS = 0.1;
+/** A walk moves on the ground plane: the world's up. */
+const WALK_UP = new THREE.Vector3(0, 1, 0);
 
 /** A material Fragments makes reaches a mesh within a few frames of being made. */
 const REFERENCE_MATERIAL_WATCH_FRAMES = 30;
@@ -100,7 +135,7 @@ const GROUP_STYLE: Record<RenderGroup, { color: number; roughness: number; metal
   duct: { color: 0x2f7fd8, roughness: 0.45, metalness: 0.35 },
   duct_fitting: { color: 0x2569b8, roughness: 0.45, metalness: 0.35 },
   terminal: { color: 0xe9eef5, roughness: 0.6, metalness: 0.1 },
-  equipment: { color: 0x5b6b7a, roughness: 0.55, metalness: 0.4 },
+  equipment: { color: 0xb8c2cc, roughness: 0.24, metalness: 0.82 },
   pipe: { color: 0x2ea86b, roughness: 0.4, metalness: 0.3 },
   electrical: { color: 0xd9a21b, roughness: 0.5, metalness: 0.2 },
   sprinkler: { color: 0xd8463b, roughness: 0.45, metalness: 0.3 },
@@ -111,8 +146,8 @@ const GROUP_STYLE: Record<RenderGroup, { color: number; roughness: number; metal
   furnishing: { color: 0xb59a7a, roughness: 0.85, metalness: 0 },
   insulation: { color: 0xe8d9a8, roughness: 0.95, metalness: 0, opacity: 0.35 },
   mounting_plane: { color: 0x8fb3d9, roughness: 0.9, metalness: 0, opacity: 0.25 },
-  filler: { color: 0x8a6f52, roughness: 0.7, metalness: 0.05 },
-  glazing: { color: 0x9fc8e8, roughness: 0.1, metalness: 0.1, opacity: 0.3 },
+  filler: { color: 0x3c3a37, roughness: 0.42, metalness: 0.32 },
+  glazing: { color: 0x7ba9c4, roughness: 0.06, metalness: 0.28, opacity: 0.36 },
 };
 
 /** Plan symbols sit this far under the cut, so the cut never clips them. */
@@ -226,6 +261,22 @@ export function choosePickHits<P>(hits: readonly { readonly pick: P; readonly se
   return { solid: hits.find((h) => !h.seeThrough)?.pick ?? null, seeThrough: hits.find((h) => h.seeThrough)?.pick ?? null };
 }
 
+/**
+ * Detect CPU software WebGL renderers (SwiftShader, llvmpipe, Windows Basic Render Driver)
+ * where per-fragment 9-tap PCF shadows and PMREM IBL cut frame rate in half and starve UI input.
+ */
+function isSoftwareWebGL(renderer: THREE.WebGLRenderer): boolean {
+  try {
+    const gl = renderer.getContext();
+    const dbg = gl.getExtension("WEBGL_debug_renderer_info");
+    const unmasked = dbg ? String(gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) ?? "") : "";
+    const basic = String(gl.getParameter(gl.RENDERER) ?? "");
+    return /swiftshader|llvmpipe|software|basic render driver|mesa offscreen/i.test(`${unmasked} ${basic}`);
+  } catch {
+    return false;
+  }
+}
+
 export class ModelViewer3D {
   readonly scene = new THREE.Scene();
   readonly renderer: THREE.WebGLRenderer;
@@ -233,10 +284,36 @@ export class ModelViewer3D {
   private readonly ortho: THREE.OrthographicCamera;
   /** The 3D view's parallel camera (plan keeps its own straight-down one). */
   private readonly orthoView: THREE.OrthographicCamera;
+  private sunLight: THREE.DirectionalLight | null = null;
+  private lightingController: SceneLightingController | null = null;
+  private readonly lightEmitterRoot = new THREE.Group();
+  private readonly lightFocusScratch = new THREE.Vector3();
+  private shadowsEnabled = true;
+  private renderQuality: "draft" | "standard" | "high" = "standard";
+  private studioEnv: THREE.Texture | null = null;
+  private paused = false;
+  private contextLost = false;
+  private readonly onContextLostHandler: (e: Event) => void;
+  private readonly onContextRestoredHandler: () => void;
+  private readonly onVisibilityChangeHandler: () => void;
   private projection: Projection = "perspective";
   /** Where the 3D view was looking when plan took over (a projection switch in plan frames about it). */
   private readonly last3dTarget = new THREE.Vector3();
   private controls: PointZoomControls;
+  /** Walking (`setWalk`): whether the mode holds, the keys held for it and the speed they have eased to. */
+  private walkOn = false;
+  private readonly walk = new WalkMotion();
+  /** A key held when the window loses focus never comes up: nothing keeps walking. */
+  private readonly stopWalkOnBlur = releaseWalkOnBlur(this.walk, window);
+  private readonly walkListeners = new Set<(walking: boolean) => void>();
+  private readonly walkSpeedListeners = new Set<(scale: number) => void>();
+  private readonly walkStep = new THREE.Vector3();
+  private readonly walkForward = new THREE.Vector3();
+  private readonly walkRight = new THREE.Vector3();
+  /** Exclusive owner of 3D camera navigation (walk mode, floor-walk, flyover, or host mode). */
+  private activeCameraMode: CameraModeClaim | null = null;
+  private readonly cameraModeListeners = new Set<(mode: string | null) => void>();
+  private releaseWalkMode: (() => void) | null = null;
   /** A completed click or a wheel zoom chose the orbit point (the controls' target); false: it follows the middle of the model. */
   private orbitPointPinned = false;
   private zoomFloor = 1;
@@ -259,6 +336,7 @@ export class ModelViewer3D {
   private readonly ghostRoot = new THREE.Group();
   /** Hover pre-highlight and group selection, over the model; never picked. */
   private readonly highlightRoot = new THREE.Group();
+  private groundShadowPlane: THREE.Mesh | null = null;
   /** While routing: the face the route would join (an open end, a tap location). Over the model; never picked. */
   private readonly joinRoot = new THREE.Group();
   private readonly groupRoot = new THREE.Group();
@@ -269,6 +347,8 @@ export class ModelViewer3D {
   private selectedOverlayShown = false;
   /** Plan only: the plan symbols the printed drawing draws (a door's swing, a window's lines), over the cut; never picked. */
   private readonly planSymbolRoot = new THREE.Group();
+  /** Trade-agnostic 3D false-color scalar heatmap overlay (e.g. illuminance, coverage); never picked. */
+  private readonly scalarHeatmapRoot = new THREE.Group();
   private planSymbolMaterial: THREE.LineBasicMaterial | null = null;
   /** Plan text textures by colour and text, kept across redraws; freed on dispose. */
   private readonly planTextTextures = new Map<string, { texture: THREE.CanvasTexture; aspect: number }>();
@@ -283,8 +363,10 @@ export class ModelViewer3D {
   private readonly referenceRoot = new THREE.Group();
   private readonly markerRoot = new THREE.Group();
   private readonly palette: ViewerPalette;
-  /** The origin marker's arrows, in the theme's axis colors (the axis lines and label are drawn over the canvas from `originGizmoScreen`). */
+  /** The origin marker's arrows, in the theme's axis colors. */
   private readonly origin: THREE.Group;
+  /** Depth-aware 3D dashed axis lines (crisp in front of the building, softly dimmed behind it). */
+  private readonly originAxes: THREE.Group;
   /** The project origin (base point), scene metres: the orbit point when none is chosen and nothing is loaded or drawn. */
   private readonly projectOrigin = new THREE.Vector3();
   private referencesBoxCache: Promise<THREE.Box3> | null = null;
@@ -320,6 +402,7 @@ export class ModelViewer3D {
   private readonly cropOutline: CropBoxOutline;
   private readonly cameraListeners = new Set<() => void>();
   private readonly cameraSettledListeners = new Set<() => void>();
+  private fovDirty = false;
   private readonly pointerClaims = new Set<symbol>();
   private selected: Pick | null = null;
   private frameCount = 0;
@@ -338,13 +421,82 @@ export class ModelViewer3D {
     this.elevations = options.elevations ?? DEFAULT_ELEVATIONS;
     this.palette = new ViewerPalette(options.colors);
     this.origin = buildArrows(this.palette.axes);
+    this.originAxes = buildDepthAwareAxisLines(this.palette.axes);
+    this.originAxes.visible = false;
     this.cropOutline = new CropBoxOutline(this.palette.css("selectionOutline"));
     this.overlayScene.add(this.cropOutline.object);
-    this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: "high-performance", logarithmicDepthBuffer: true });
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    // Standard hardware 24-bit depth buffer (logarithmicDepthBuffer writes gl_FragDepth, which disables hardware gl.polygonOffset and early-Z culling).
+    // Capture Chrome's real webglcontextcreationerror message so a browser-level GPU lockout (GL_VENDOR = Disabled / BindToCurrentSequence)
+    // is reported clearly without hammering Chrome's GPU process with repeated doomed retries.
+    let creationErrorDetail = "";
+    const makeRenderer = (attrs: THREE.WebGLRendererParameters): THREE.WebGLRenderer => {
+      const canvas = document.createElement("canvas");
+      const onCreationErr = (e: Event) => {
+        const msg = (e as { statusMessage?: string }).statusMessage;
+        if (typeof msg === "string" && msg.trim()) creationErrorDetail = msg.trim();
+      };
+      canvas.addEventListener("webglcontextcreationerror", onCreationErr);
+      try {
+        return new THREE.WebGLRenderer({ canvas, ...attrs });
+      } finally {
+        canvas.removeEventListener("webglcontextcreationerror", onCreationErr);
+      }
+    };
+    const isBrowserGpuDisabled = (detail: string) =>
+      /GL_VENDOR\s*=\s*Disabled|GL_RENDERER\s*=\s*Disabled|BindToCurrentSequence failed|hardware acceleration/i.test(detail);
+    try {
+      this.renderer = makeRenderer({ antialias: true, alpha: false, powerPreference: "high-performance" });
+    } catch (firstErr) {
+      if (isBrowserGpuDisabled(creationErrorDetail)) {
+        throw new Error(
+          `Your browser has disabled GPU/WebGL for this session (${creationErrorDetail}). Fully quit and reopen Chrome (Cmd+Q), and make sure "Use graphics acceleration when available" is enabled in Chrome Settings -> System.`,
+        );
+      }
+      try {
+        this.renderer = makeRenderer({ antialias: false, alpha: false, powerPreference: "default" });
+      } catch {
+        if (isBrowserGpuDisabled(creationErrorDetail)) {
+          throw new Error(
+            `Your browser has disabled GPU/WebGL for this session (${creationErrorDetail}). Fully quit and reopen Chrome (Cmd+Q), and make sure "Use graphics acceleration when available" is enabled in Chrome Settings -> System.`,
+          );
+        }
+        throw firstErr;
+      }
+    }
+    const canvasEl = this.renderer.domElement;
+    this.onContextLostHandler = (e: Event) => {
+      e.preventDefault();
+      this.contextLost = true;
+      this.syncAnimationLoop();
+    };
+    this.onContextRestoredHandler = () => {
+      this.contextLost = false;
+      if (!this.disposed) {
+        this.renderer.shadowMap.needsUpdate = true;
+        this.syncAnimationLoop();
+      }
+    };
+    this.onVisibilityChangeHandler = () => {
+      this.syncAnimationLoop();
+    };
+    canvasEl.addEventListener("webglcontextlost", this.onContextLostHandler);
+    canvasEl.addEventListener("webglcontextrestored", this.onContextRestoredHandler);
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", this.onVisibilityChangeHandler);
+    }
+    const softwareGpu = isSoftwareWebGL(this.renderer);
+    if (softwareGpu) {
+      this.renderQuality = "draft";
+    }
+    this.renderer.setPixelRatio(softwareGpu ? 1 : Math.min(window.devicePixelRatio || 1, 1.5));
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.05;
+    this.renderer.toneMappingExposure = softwareGpu ? 1.0 : 1.05;
+    this.renderer.shadowMap.enabled = !softwareGpu;
+    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    // Shadows only change when geometry, visibility, clipping, sun, or quality change — never on mouse hover/orbit.
+    this.renderer.shadowMap.autoUpdate = false;
+    this.renderer.shadowMap.needsUpdate = !softwareGpu;
     this.renderer.localClippingEnabled = false;
     // Counted per frame, across the model pass and the crop box outline pass.
     this.renderer.info.autoReset = false;
@@ -353,18 +505,62 @@ export class ModelViewer3D {
     container.appendChild(this.renderer.domElement);
 
     this.scene.background = this.palette.background;
-    // Low ambient + a strong key light so walls, floors and roof planes read as different surfaces.
-    this.scene.add(new THREE.HemisphereLight(0xffffff, 0x7d8794, 0.95));
-    const sun = new THREE.DirectionalLight(0xfff6ea, 2.3);
+    if (!softwareGpu) {
+      const env = buildStudioEnvironment(this.renderer);
+      if (env) {
+        this.studioEnv = env;
+        this.scene.environment = env;
+        this.scene.environmentIntensity = 0.65;
+      }
+    }
+    // Low ambient + a strong key light with soft shadows so walls, openings and floors read with real depth.
+    const hemi = new THREE.HemisphereLight(0xf6f8fc, 0x7d8794, softwareGpu ? 0.95 : 0.85);
+    this.scene.add(hemi);
+    const sun = new THREE.DirectionalLight(0xfff6ea, softwareGpu ? 2.3 : 2.2);
     sun.position.set(60, 100, 35);
+    sun.castShadow = !softwareGpu;
+    sun.shadow.mapSize.set(2048, 2048);
+    sun.shadow.camera.near = 1;
+    sun.shadow.camera.far = 300;
+    const sc = 45;
+    sun.shadow.camera.left = -sc;
+    sun.shadow.camera.right = sc;
+    sun.shadow.camera.top = sc;
+    sun.shadow.camera.bottom = -sc;
+    sun.shadow.bias = -0.0002;
+    sun.shadow.normalBias = 0.04;
+    this.sunLight = sun;
     this.scene.add(sun);
-    const fill = new THREE.DirectionalLight(0xdfe8ff, 0.45);
+    const fill = new THREE.DirectionalLight(0xdfe8ff, 0.5);
     fill.position.set(-50, 30, -40);
     this.scene.add(fill);
-    this.scene.add(this.referenceRoot, this.nativeRoot, this.markerRoot, this.ghostRoot, this.groupRoot, this.highlightRoot, this.joinRoot, this.planSymbolRoot, this.selectedRoot, this.origin);
+    this.lightEmitterRoot.name = "light-emitter-root";
+    this.lightingController = new SceneLightingController(
+      this.renderer,
+      this.scene,
+      hemi,
+      sun,
+      fill,
+      this.lightEmitterRoot,
+      this.studioEnv,
+      this.palette.background,
+    );
+    // Subtle matte architectural ground shadow catcher positioned below the lowest slab (FrontSide only, never visible from underneath).
+    const groundShadow = new THREE.Mesh(
+      new THREE.PlaneGeometry(400, 400),
+      new THREE.ShadowMaterial({ opacity: 0.14, side: THREE.FrontSide }),
+    );
+    groundShadow.rotation.x = -Math.PI / 2;
+    groundShadow.position.y = -0.3;
+    groundShadow.receiveShadow = true;
+    groundShadow.visible = !softwareGpu;
+    groundShadow.name = "architectural-ground-shadow";
+    this.groundShadowPlane = groundShadow;
+    this.scene.add(groundShadow);
+    this.scene.add(this.referenceRoot, this.nativeRoot, this.markerRoot, this.ghostRoot, this.groupRoot, this.highlightRoot, this.joinRoot, this.planSymbolRoot, this.scalarHeatmapRoot, this.lightEmitterRoot, this.selectedRoot, this.originAxes, this.origin);
 
     const { width, height } = this.size();
-    this.perspective = new THREE.PerspectiveCamera(45, width / height, 0.1, 5000);
+    this.perspective = new THREE.PerspectiveCamera(45, width / height, 0.15, 3000);
     this.perspective.position.set(40, 30, 40);
     this.ortho = new THREE.OrthographicCamera(-50, 50, 50, -50, -1000, 1000);
     // A parallel view has no "behind the eye": the near plane sits far back so orbiting close never clips the model.
@@ -384,7 +580,7 @@ export class ModelViewer3D {
 
     this.resizeObserver = new ResizeObserver(() => this.onContainerResize());
     this.resizeObserver.observe(container);
-    this.renderer.setAnimationLoop(() => this.tick());
+    this.syncAnimationLoop();
   }
 
   private size(): { width: number; height: number } {
@@ -393,10 +589,14 @@ export class ModelViewer3D {
 
   private makeControls(camera: THREE.PerspectiveCamera | THREE.OrthographicCamera): PointZoomControls {
     const controls = makeCameraControls(camera, this.renderer.domElement);
+    // Plan, 3D and projection changes make fresh controls; a walk holds across them.
+    controls.walking = this.walkOn;
     controls.zoomFloor = this.zoomFloor;
     controls.zoomAnchor = this.zoomAnchorAt;
     controls.onPassThrough = () => this.emitPassThrough(true);
     controls.onZoomExtents = () => void this.frame().catch((err: unknown) => console.error("[ModelViewer3D] zoom extents failed", err));
+    // The pace wheel while walking: each notch is a step in log terms (about 1.26, up or down).
+    controls.onWalkSpeed = (direction) => this.setWalkSpeed(Math.pow(10, Math.log10(this.walk.speedScale) + direction * WALK_SPEED_WHEEL_LOG_STEP));
     // Fresh controls (plan / 3D / projection / plan-up) start with nothing to step back out of.
     this.emitPassThrough(false);
     controls.onZoomAnchor = () => {
@@ -447,12 +647,49 @@ export class ModelViewer3D {
     void this.fragments.update(true);
   }
 
+  /**
+   * Pause or resume the 3D WebGL render loop (e.g. while 2D plans, sheets, or schedules cover the canvas)
+   * so background surfaces consume 0% GPU without sacrificing any 3D render quality when visible.
+   */
+  setPaused(paused: boolean): void {
+    if (this.paused === paused) return;
+    this.paused = paused;
+    if (paused) {
+      this.releaseCameraMode();
+      this.walk.stop();
+    }
+    this.syncAnimationLoop();
+  }
+
+  private syncAnimationLoop(): void {
+    const hidden = typeof document !== "undefined" && document.hidden;
+    if (hidden) this.walk.releaseAll();
+    if (this.disposed || this.paused || this.contextLost || hidden) {
+      this.renderer.setAnimationLoop(null);
+    } else {
+      this.clock.getDelta();
+      this.renderer.setAnimationLoop(() => this.tick());
+    }
+  }
+
   private tick() {
-    if (this.disposed) return;
+    if (this.disposed || this.paused || this.contextLost) return;
     const delta = this.clock.getDelta();
+    this.stepWalk(delta);
     this.controls.update(delta);
     this.renderer.info.reset();
-    if (this.origin.visible) this.origin.scale.setScalar(ARROW_PX * metresPerPixel(this.camera(), this.origin.position, this.size().height));
+    const hPx = this.size().height;
+    if (this.origin.visible) this.origin.scale.setScalar(ARROW_PX * metresPerPixel(this.camera(), this.origin.position, hPx));
+    const show3dAxes = this.origin.visible && this.mode === "3d";
+    this.originAxes.visible = show3dAxes;
+    if (show3dAxes) {
+      this.originAxes.position.copy(this.origin.position);
+      updateDepthAwareAxisLines(this.originAxes, this.camera(), this.origin.position, hPx);
+    }
+    if (this.mode === "3d" && this.lightingController) {
+      this.controls.getTarget(this.lightFocusScratch);
+      this.lightingController.updateCameraFocus(this.camera(), this.lightFocusScratch);
+    }
     this.toneNewReferenceMaterials();
     this.renderer.render(this.scene, this.camera());
     if (this.cropOutline.object.visible) {
@@ -509,6 +746,7 @@ export class ModelViewer3D {
     this.referencesBoxCache = null;
     if (this.referenceTones.has(spec.id) || this.sessionHiddenReferences.has(spec.id)) await this.applyReferenceTone(spec.id, entry);
     void this.refreshOrbitFallback();
+    this.invalidateShadows();
     return info;
   }
 
@@ -522,6 +760,7 @@ export class ModelViewer3D {
     this.referencesBoxCache = null;
     await this.fragments.disposeModel(id);
     await this.fragments.update(true);
+    this.invalidateShadows();
     await this.refreshOrbitFallback();
   }
 
@@ -544,6 +783,7 @@ export class ModelViewer3D {
     const ref = this.references.get(id);
     if (ref && ref.model.object.visible !== visible) {
       ref.model.object.visible = visible;
+      this.invalidateShadows();
       this.referencesBoxCache = null;
       void this.refreshOrbitFallback();
     }
@@ -722,6 +962,15 @@ export class ModelViewer3D {
 
     const solids = modelSolids(view, this.elevations, levels ?? undefined);
     this.lastSolids = solids;
+    // Keep the ground shadow catcher cleanly below the lowest foundation slab in any model.
+    if (this.groundShadowPlane && solids.length > 0) {
+      let lowestY = Infinity;
+      for (const s of solids) {
+        const y = s.center[1] - s.size[1] / 2;
+        if (y < lowestY) lowestY = y;
+      }
+      if (Number.isFinite(lowestY)) this.groundShadowPlane.position.y = lowestY - 0.015;
+    }
     this.solidsById = new Map();
     for (const s of solids) {
       const list = this.solidsById.get(s.elementId);
@@ -737,12 +986,12 @@ export class ModelViewer3D {
     const skip = (s: Solid) => this.hiddenGroups.has(s.group) || this.hiddenElements.has(s.elementId);
     const materialFor = (s: Solid) => {
       const tone = tones.get(s.elementId);
-      return tone ? this.toneMaterial(s.group, tone, s.tint) : this.material(s.group, s.tint);
+      return tone ? this.toneMaterial(s.group, tone, s.tint) : this.material(s.group, s.tint, s.materialId);
     };
 
-    // Joined walls draw as one mesh per level and category; a selected, provisional or toned wall draws alone.
+    // Joined walls draw as one mesh per level, category and material; a selected, provisional or toned wall draws alone.
     const selectedId = this.selected?.source === "native" ? this.selected.elementId : null;
-    const { batches, rest } = batchMeshSolids(solids, (s) => (s.group === "wall" && s.tint === undefined && s.elementId !== selectedId && !provisional.has(s.elementId) && !tones.has(s.elementId) && !skip(s) ? `${view.elements[s.elementId]?.partition?.level ?? ""}:${s.group}` : null));
+    const { batches, rest } = batchMeshSolids(solids, (s) => (s.group === "wall" && s.tint === undefined && s.elementId !== selectedId && !provisional.has(s.elementId) && !tones.has(s.elementId) && !skip(s) ? `${view.elements[s.elementId]?.partition?.level ?? ""}:${s.group}:${s.materialId ?? ""}` : null));
     for (const b of batches) this.drawBatch(b);
 
     if (rest.length > INSTANCE_THRESHOLD) {
@@ -758,6 +1007,7 @@ export class ModelViewer3D {
     }
     this.keepInPlanCut(this.authoredBox());
     this.drawPlanSymbols();
+    this.invalidateShadows();
     // Previews (a drag, a route being drawn) leave the orbit point alone; it follows the model once the edit lands.
     if (view === accepted) void this.refreshOrbitFallback();
   }
@@ -917,10 +1167,16 @@ export class ModelViewer3D {
       if (this.hiddenElements.has(id)) continue;
       for (const s of this.solidsById.get(id) ?? []) {
         if (this.hiddenGroups.has(s.group)) continue;
-        const geometry = solidGeometry(s);
+        const rawGeo = solidGeometry(s);
+        // Push overlay geometry 2.2 mm outward along face normals so hover/selection never z-fights with batched meshes.
+        const geometry = inflateAlongNormals(rawGeo, 0.0022);
+        rawGeo.dispose();
         const mesh = new THREE.Mesh(geometry, material);
         placeSolid(mesh, s);
-        if (material === this.palette.groupSelected) mesh.add(new THREE.LineSegments(new THREE.EdgesGeometry(geometry, 30), this.palette.selectedEdge));
+        mesh.renderOrder = 2;
+        if (material === this.palette.groupSelected || material === this.palette.selected) {
+          mesh.add(new THREE.LineSegments(cleanEdgesGeometry(geometry, 30), this.palette.selectedEdge));
+        }
         root.add(mesh);
       }
     }
@@ -973,14 +1229,39 @@ export class ModelViewer3D {
     else this.hiddenGroups.add(group);
   }
 
-  /** One material per group, and per system colour within it (so instancing still batches each colour). */
-  private material(group: RenderGroup, tint?: number): THREE.MeshStandardMaterial {
-    const key = `${group}:${tint ?? ""}`;
+  /** One material per group, system colour, and registered material id (so instancing & wall batching still share materials). */
+  private material(group: RenderGroup, tint?: number, materialId?: string): THREE.MeshStandardMaterial {
+    const key = `${group}:${tint ?? ""}:${materialId ?? ""}`;
     let entry = this.materials.get(key);
     if (!entry) {
       const style = GROUP_STYLE[group];
-      const seeThrough = style.opacity !== undefined ? { transparent: true, opacity: style.opacity, depthWrite: false } : {};
-      entry = { group, material: new THREE.MeshStandardMaterial({ color: tint ?? style.color, roughness: style.roughness, metalness: style.metalness, ...seeThrough }), ...(tint !== undefined ? { tint } : {}) };
+      const matDef = materialId ? materialOf(materialId) : null;
+      const matColor = matDef ? (parseHexColor(matDef.color) ?? style.color) : style.color;
+      const color = tint ?? matColor;
+      const roughness = matDef?.roughness ?? style.roughness;
+      const metalness = matDef?.metalness ?? style.metalness;
+      const opacity = matDef?.opacity ?? style.opacity;
+      const seeThrough = opacity !== undefined && opacity < 1 ? { transparent: true, opacity, depthWrite: false } : {};
+      const defaultPattern: MaterialPattern | undefined =
+        group === "wall" ? "gypsum" : group === "slab" ? "concrete" : group === "filler" ? "wood" : undefined;
+      const pattern = matDef?.pattern ?? defaultPattern;
+      const colorHex = `#${color.toString(16).padStart(6, "0")}`;
+      const maps = pattern && opacity === undefined ? proceduralMaterialMaps(pattern, colorHex, materialId) : null;
+      const mat = new THREE.MeshStandardMaterial({
+        color: maps ? 0xffffff : color,
+        roughness,
+        metalness,
+        ...(group === "duct" || group === "duct_fitting" || group === "pipe" || group === "insulation" ? { side: THREE.DoubleSide } : {}),
+        ...(maps ? { map: maps.map, bumpMap: maps.bumpMap, bumpScale: maps.bumpScale } : {}),
+        // Push coplanar slab edges and roof/column faces subtly behind exterior wall cladding so flush wall-to-slab/parapet joints never z-fight.
+        ...(group === "slab"
+          ? { polygonOffset: true, polygonOffsetFactor: 2, polygonOffsetUnits: 2 }
+          : group === "structure"
+            ? { polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 }
+            : {}),
+        ...seeThrough,
+      });
+      entry = { group, material: mat, ...(tint !== undefined ? { tint } : matDef ? { tint: color } : {}) };
       this.styleMaterial(entry);
       this.materials.set(key, entry);
     }
@@ -1004,6 +1285,11 @@ export class ModelViewer3D {
       if (child instanceof THREE.Mesh && child.material instanceof THREE.Material) child.material.dispose();
     }
     for (const child of [...buildArrows(this.palette.axes).children]) this.origin.add(child);
+    for (const child of [...this.originAxes.children]) {
+      this.originAxes.remove(child);
+      disposeObject(child);
+    }
+    for (const child of [...buildDepthAwareAxisLines(this.palette.axes).children]) this.originAxes.add(child);
     if (this.markerMaterials) {
       // Sprites keep their material; only the drawn symbol changes.
       const outline = this.palette.css("edges");
@@ -1032,7 +1318,7 @@ export class ModelViewer3D {
   private styleMaterial(entry: { group: RenderGroup; tint?: number; material: THREE.MeshStandardMaterial }) {
     const m = entry.material;
     m.wireframe = this.visualStyle === "wireframe";
-    m.color.set(this.visualStyle === "hidden_line" ? 0xffffff : (entry.tint ?? GROUP_STYLE[entry.group].color));
+    m.color.set(this.visualStyle === "hidden_line" || m.map ? 0xffffff : (entry.tint ?? GROUP_STYLE[entry.group].color));
     m.needsUpdate = true;
   }
 
@@ -1051,14 +1337,29 @@ export class ModelViewer3D {
 
   private drawSolid(s: Solid, material: THREE.Material, outline: boolean, dashedEdges = false) {
     const geometry = solidGeometry(s);
+    const modelEl = this.lastAuthored?.view.elements[s.elementId];
+    if (modelEl?.kind === "ceiling") {
+      const grid = modelEl.grid ?? { spacingXMm: 1219.2, spacingYMm: 609.6 };
+      // Mesh vertices are local to `s.center` (Three.js metres where kernelX = x*1000, kernelY = -z*1000);
+      // convert the kernel world grid origin into mesh-local mm so 3D tile joints match the RCP and snapped devices.
+      const localOrigin = {
+        x: (grid.origin?.x ?? 0) - s.center[0] * 1000,
+        y: (grid.origin?.y ?? 0) + s.center[2] * 1000,
+      };
+      applyCeilingGridUVs(geometry, { ...grid, origin: localOrigin });
+    } else {
+      ensureBoxUVs(geometry);
+    }
     const mesh = new THREE.Mesh(geometry, material);
+    mesh.castShadow = s.group !== "glazing" && s.group !== "mounting_plane";
+    mesh.receiveShadow = true;
     placeSolid(mesh, s);
     mesh.userData.elementId = s.elementId;
     if (dashedEdges) {
-      const edges = new THREE.LineSegments(new THREE.EdgesGeometry(geometry, 30), this.dashedEdgeMaterial());
+      const edges = new THREE.LineSegments(cleanEdgesGeometry(geometry, 30), this.dashedEdgeMaterial());
       edges.computeLineDistances();
       mesh.add(edges);
-    } else if (outline) mesh.add(new THREE.LineSegments(new THREE.EdgesGeometry(geometry, 30), material === this.palette.selected ? this.palette.selectedEdge : this.palette.edge));
+    } else if (outline) mesh.add(new THREE.LineSegments(cleanEdgesGeometry(geometry, 30), material === this.palette.selected ? this.palette.selectedEdge : this.palette.edge));
     this.nativeRoot.add(mesh);
     this.nativeEntries.push({ object: mesh, elementId: s.elementId });
   }
@@ -1069,9 +1370,12 @@ export class ModelViewer3D {
     geometry.setAttribute("position", new THREE.BufferAttribute(b.positions, 3));
     geometry.setIndex(new THREE.BufferAttribute(b.indices, 1));
     geometry.computeVertexNormals();
-    const mesh = new THREE.Mesh(geometry, this.material(b.group));
+    ensureBoxUVs(geometry);
+    const mesh = new THREE.Mesh(geometry, this.material(b.group, undefined, b.materialId));
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
     mesh.userData.group = b.group;
-    mesh.add(new THREE.LineSegments(new THREE.EdgesGeometry(geometry, 30), this.palette.edge));
+    mesh.add(new THREE.LineSegments(cleanEdgesGeometry(geometry, 30), this.palette.edge));
     this.nativeRoot.add(mesh);
     const first = b.owners[0];
     if (first !== undefined) this.nativeEntries.push({ object: mesh, elementId: first, batch: b });
@@ -1128,6 +1432,11 @@ export class ModelViewer3D {
    */
   setMode(mode: ViewMode, cutElevationMm?: number) {
     if (mode === this.mode) return;
+    // Nothing to walk or drive in plan: any active 3D camera mode ends at once.
+    if (mode === "plan") {
+      this.releaseCameraMode();
+      this.walk.stop();
+    }
     const target = new THREE.Vector3();
     this.controls.getTarget(target);
     const enabled = this.controls.enabled;
@@ -1136,8 +1445,18 @@ export class ModelViewer3D {
     if (mode === "plan") {
       this.last3dTarget.copy(target);
       const work = this.authoredBox();
-      const cutM = cutElevationMm !== undefined ? cutElevationMm * MM : work.isEmpty() ? 1.2 : work.max.y + 0.3;
+      // Default Live Plan cut sits 1.5 m above the lowest authored floor (clips roofs & upper-level slabs out of the floor plan).
+      const defaultCutM = work.isEmpty() ? 1.5 : work.min.y + 1.5;
+      const cutM = cutElevationMm !== undefined ? cutElevationMm * MM : defaultCutM;
       this.cutPlane = new THREE.Plane(new THREE.Vector3(0, -1, 0), cutM);
+      if (this.sunLight) this.sunLight.castShadow = false;
+      if (this.groundShadowPlane) this.groundShadowPlane.visible = false;
+      this.lightingController?.apply(this.lightingController.getPreset(), {
+        is3d: false,
+        shadowsEnabled: false,
+        renderQuality: this.renderQuality,
+        customBackground: true,
+      });
       this.scene.background = this.palette.planBackground;
       void this.setPlanCategoriesVisible(false);
       this.ortho.position.set(target.x, 200, target.z);
@@ -1153,7 +1472,17 @@ export class ModelViewer3D {
       this.carryControlState(enabled);
     } else {
       this.cutPlane = null;
+      const shadowsActive = this.shadowsEnabled && this.renderQuality !== "draft";
+      if (this.sunLight) this.sunLight.castShadow = shadowsActive;
+      if (this.groundShadowPlane) this.groundShadowPlane.visible = shadowsActive;
       this.scene.background = this.palette.background;
+      if (this.lightingController) {
+        this.lightingController.apply(this.lightingController.getPreset(), {
+          is3d: true,
+          shadowsEnabled: this.shadowsEnabled,
+          renderQuality: this.renderQuality,
+        });
+      }
       void this.setPlanCategoriesVisible(true);
       const camera = this.camera3d();
       // An orbit point a click or a zoom chose survives a trip to plan: the 3D camera comes back as it was, orbiting that point.
@@ -1281,6 +1610,10 @@ export class ModelViewer3D {
    */
   setProjection(projection: Projection) {
     if (projection === this.projection) return;
+    if (projection === "orthographic") {
+      this.releaseCameraMode();
+      this.walk.stop();
+    }
     const from = this.camera3d();
     this.projection = projection;
     const to = this.camera3d();
@@ -1311,6 +1644,39 @@ export class ModelViewer3D {
     return this.projection;
   }
 
+  /**
+   * Lens angle of the perspective camera, degrees (clamped to 5..120, the range a
+   * saved 3D camera may store). Felt at once in perspective; an orthographic view
+   * keeps its framing, and the angle applies again on the switch back.
+   * Pass `{ settle: false }` while dragging a slider and `{ settle: true }` (default)
+   * when the gesture finishes so camera memory saves once without per-tick churn.
+   */
+  setFovDeg(fovDeg: number, options?: { readonly settle?: boolean }) {
+    const clamped = Math.min(120, Math.max(5, fovDeg));
+    const changed = Math.abs(this.perspective.fov - clamped) > 1e-6;
+    if (changed) {
+      this.perspective.fov = clamped;
+      this.perspective.updateProjectionMatrix();
+      this.fovDirty = true;
+      void this.fragments.update(true);
+      for (const listener of this.cameraListeners) listener();
+    }
+    if (options?.settle !== false && this.fovDirty) {
+      this.fovDirty = false;
+      for (const listener of this.cameraSettledListeners) listener();
+    }
+  }
+
+  /** The perspective camera's lens angle, degrees. */
+  getFovDeg(): number {
+    return this.perspective.fov;
+  }
+
+  /** Visible vertical span of the orthographic 3D camera, mm. */
+  getOrthoHeightMm(): number {
+    return (this.orthoView.top - this.orthoView.bottom) / Math.max(1e-6, this.orthoView.zoom) / MM;
+  }
+
   /** Look from `eye` at `target`; a parallel view zooms to frame what a perspective eye there would see. */
   private async lookFrom(eye: THREE.Vector3, target: THREE.Vector3, animate: boolean) {
     const camera = this.camera();
@@ -1328,7 +1694,112 @@ export class ModelViewer3D {
   resetPlanCut() {
     if (this.mode !== "plan" || !this.cutPlane) return;
     const work = this.authoredBox();
-    this.setPlanCut((work.isEmpty() ? 1.2 : work.max.y + 0.3) / MM);
+    this.setPlanCut((work.isEmpty() ? 1.5 : work.min.y + 1.5) / MM);
+  }
+
+  /** Mark the cached directional shadow map dirty so the next frame refreshes it once. */
+  private invalidateShadows() {
+    if (this.renderer?.shadowMap) this.renderer.shadowMap.needsUpdate = true;
+  }
+
+  /** Set the 3D directional sun angle in degrees (`azimuthDeg`: 0 = East, 90 = South, 180 = West; `elevationDeg`: 5..85). */
+  setSun(azimuthDeg: number, elevationDeg: number) {
+    if (!this.sunLight) return;
+    const az = (azimuthDeg * Math.PI) / 180;
+    const el = (Math.max(5, Math.min(85, elevationDeg)) * Math.PI) / 180;
+    const dist = 120;
+    const horiz = Math.cos(el) * dist;
+    this.sunLight.position.set(Math.cos(az) * horiz, Math.sin(el) * dist, Math.sin(az) * horiz);
+    this.invalidateShadows();
+  }
+
+  /** Turn 3D sun shadows on or off (always off in 2D plan mode and Draft quality). */
+  setShadows(enabled: boolean) {
+    this.shadowsEnabled = enabled;
+    const active = this.mode === "3d" && enabled && this.renderQuality !== "draft";
+    if (this.sunLight) this.sunLight.castShadow = active;
+    if (this.groundShadowPlane) this.groundShadowPlane.visible = active;
+    this.invalidateShadows();
+  }
+
+  /** Switch 3D visual rendering quality (`draft` = fast matte, `standard` = balanced PBR + shadows, `high` = crisp 4K shadow map + rich studio exposure). */
+  setRenderQuality(quality: "draft" | "standard" | "high") {
+    this.renderQuality = quality;
+    const shadowsActive = this.mode === "3d" && this.shadowsEnabled && quality !== "draft";
+    if (quality === "draft") {
+      this.renderer.toneMappingExposure = 1.0;
+      this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1));
+      this.renderer.shadowMap.enabled = false;
+      this.scene.environment = null;
+      if (this.sunLight) this.sunLight.castShadow = false;
+      if (this.groundShadowPlane) this.groundShadowPlane.visible = false;
+    } else if (quality === "high") {
+      this.renderer.toneMappingExposure = 1.12;
+      this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+      this.renderer.shadowMap.enabled = true;
+      if (!this.studioEnv) this.studioEnv = buildStudioEnvironment(this.renderer);
+      if (this.studioEnv) {
+        this.scene.environment = this.studioEnv;
+        this.scene.environmentIntensity = 0.65;
+      }
+      if (this.sunLight) {
+        this.sunLight.shadow.mapSize.set(4096, 4096);
+        this.sunLight.shadow.map?.dispose();
+        this.sunLight.shadow.map = null;
+        this.sunLight.castShadow = shadowsActive;
+      }
+      if (this.groundShadowPlane) this.groundShadowPlane.visible = shadowsActive;
+    } else {
+      this.renderer.toneMappingExposure = 1.05;
+      this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
+      this.renderer.shadowMap.enabled = true;
+      if (!this.studioEnv) this.studioEnv = buildStudioEnvironment(this.renderer);
+      if (this.studioEnv) {
+        this.scene.environment = this.studioEnv;
+        this.scene.environmentIntensity = 0.65;
+      }
+      if (this.sunLight) {
+        this.sunLight.shadow.mapSize.set(2048, 2048);
+        this.sunLight.shadow.map?.dispose();
+        this.sunLight.shadow.map = null;
+        this.sunLight.castShadow = shadowsActive;
+      }
+      if (this.groundShadowPlane) this.groundShadowPlane.visible = shadowsActive;
+    }
+    if (this.lightingController) {
+      this.lightingController.apply(this.lightingController.getPreset(), {
+        is3d: this.mode === "3d",
+        shadowsEnabled: this.shadowsEnabled,
+        renderQuality: quality,
+      });
+    }
+    this.invalidateShadows();
+  }
+
+  getRenderQuality(): "draft" | "standard" | "high" {
+    return this.renderQuality;
+  }
+
+  /** Switch 3D time-of-day & atmosphere (`morning`, `noon`, `afternoon`, `evening`, `night`, `night_blackout`, `no_shadows`). */
+  setLightingPreset(preset: SceneLightingPreset) {
+    if (!this.lightingController) return;
+    const cfg = this.lightingController.apply(preset, {
+      is3d: this.mode === "3d",
+      shadowsEnabled: preset !== "no_shadows",
+      renderQuality: this.renderQuality,
+    });
+    this.shadowsEnabled = cfg.sunShadows;
+    if (this.groundShadowPlane) this.groundShadowPlane.visible = this.mode === "3d" && cfg.sunShadows;
+    this.invalidateShadows();
+  }
+
+  getLightingPreset(): SceneLightingPreset {
+    return this.lightingController?.getPreset() ?? "noon";
+  }
+
+  /** Set physical 3D light emitters rendered when the lighting preset illuminates active fixtures (evening/night/blackout). */
+  setLightEmitters(emitters: readonly SceneLightEmitter[]) {
+    this.lightingController?.setEmitters(emitters, this.mode === "3d", this.renderQuality);
   }
 
   setPlanCut(elevationMm: number) {
@@ -1426,6 +1897,151 @@ export class ModelViewer3D {
     return () => this.cameraSettledListeners.delete(listener);
   }
 
+  /**
+   * Claim exclusive ownership of 3D camera navigation (walk mode, floor-walk,
+   * route-follow, waypoint flyover, or a host-defined mode). Any previously
+   * active mode is stopped first via its `onStop` callback. Returns an
+   * idempotent release function.
+   */
+  claimCameraMode(id: string, onStop: () => void): () => void {
+    this.releaseCameraMode();
+    const release = () => {
+      if (this.activeCameraMode !== claim) return;
+      this.activeCameraMode = null;
+      this.notifyCameraMode(null);
+    };
+    const claim: CameraModeClaim = {
+      id,
+      stop: () => {
+        if (this.activeCameraMode !== claim) return;
+        this.activeCameraMode = null;
+        this.notifyCameraMode(null);
+        onStop();
+      },
+    };
+    this.activeCameraMode = claim;
+    this.notifyCameraMode(id);
+    return release;
+  }
+
+  /** The id of the currently active exclusive 3D camera navigation mode, or null for default orbit. */
+  cameraMode(): string | null {
+    return this.activeCameraMode?.id ?? null;
+  }
+
+  /** Stop whichever exclusive 3D camera navigation mode is currently active, if any. */
+  releaseCameraMode(): void {
+    this.activeCameraMode?.stop();
+  }
+
+  /** Hear when the active exclusive 3D camera navigation mode changes. Returns an unsubscribe. */
+  onCameraModeChange(listener: (mode: string | null) => void): () => void {
+    this.cameraModeListeners.add(listener);
+    return () => this.cameraModeListeners.delete(listener);
+  }
+
+  private notifyCameraMode(mode: string | null): void {
+    if (!this.cameraModeListeners) return;
+    for (const listener of this.cameraModeListeners) listener(mode);
+  }
+
+  private finishWalk(): void {
+    if (!this.walkOn) return;
+    this.walkOn = false;
+    this.releaseWalkMode = null;
+    this.controls.walking = false;
+    this.walk.releaseAll();
+    for (const listener of this.walkListeners) listener(false);
+  }
+
+  /**
+   * Walk the model with the keyboard: W A S D move the eye on the ground
+   * plane, the way the view faces; E and Q raise and lower it. While walking,
+   * a drag turns the view where the eye stands. It is a mode the host turns on
+   * and off (its Walk button, a key) and reports the keys for (`walkKey`):
+   * the letters are the host's own shortcuts the rest of the time. There is
+   * nothing to walk in plan or orthographic projection, where it stays off.
+   */
+  setWalk(on: boolean): void {
+    const next = on && this.mode === "3d" && this.projection === "perspective" && !this.paused && !this.disposed;
+    if (next === this.walkOn) return;
+    if (next) {
+      this.releaseWalkMode = this.claimCameraMode("walk", () => this.finishWalk());
+      this.walkOn = true;
+      this.controls.walking = true;
+      for (const listener of this.walkListeners) listener(true);
+      return;
+    }
+    const release = this.releaseWalkMode;
+    this.finishWalk();
+    release?.();
+  }
+
+  walking(): boolean {
+    return this.walkOn;
+  }
+
+  /**
+   * A key went down or came up (`code` is `KeyboardEvent.code`). True for one
+   * of the walk keys, which the host then keeps from its own shortcuts. Only
+   * held while the walk is on, so the host turns the walk on first.
+   */
+  walkKey(code: string, down: boolean): boolean {
+    const key = walkKeyOf(code);
+    if (!key) return false;
+    if (!this.walkOn) return true;
+    if (down) this.walk.hold(key);
+    else this.walk.release(key);
+    return true;
+  }
+
+  /** Hear when a walk starts or stops. Returns an unsubscribe. */
+  onWalkChange(listener: (walking: boolean) => void): () => void {
+    this.walkListeners.add(listener);
+    return () => this.walkListeners.delete(listener);
+  }
+
+  /**
+   * The walk's pace as a multiple of the distance-led speed (`walkSpeedFor`):
+   * 0.1 to 10, 1 by default. The scroll wheel with the right button held and
+   * the host's slider set it; it outlasts the walk itself.
+   */
+  setWalkSpeed(scale: number): void {
+    if (!Number.isFinite(scale)) return;
+    const next = THREE.MathUtils.clamp(scale, WALK_SPEED_SCALE_MIN, WALK_SPEED_SCALE_MAX);
+    if (next === this.walk.speedScale) return;
+    this.walk.speedScale = next;
+    for (const listener of this.walkSpeedListeners) listener(next);
+  }
+
+  /** The walk's pace multiplier (1 = the distance-led speed). */
+  walkSpeed(): number {
+    return this.walk.speedScale;
+  }
+
+  /** Hear when the walk's pace changes. Returns an unsubscribe. */
+  onWalkSpeedChange(listener: (scale: number) => void): () => void {
+    this.walkSpeedListeners.add(listener);
+    return () => this.walkSpeedListeners.delete(listener);
+  }
+
+  /** One frame of a walk, before the controls update: how far the held keys carry the eye and the orbit point together. */
+  private stepWalk(delta: number) {
+    // Navigation is off (an overlay is dragging a grip): the eye holds, keys held or not.
+    if (!this.controls.enabled || !Number.isFinite(delta) || delta <= 0) return;
+    // No walk on and no speed left to ease out.
+    if (!this.walkOn && this.walk.resting) return;
+    // A long frame (the tab was away, a stall) is one short step, not a leap.
+    const step = Math.min(delta, WALK_MAX_FRAME_SECONDS);
+    // The camera never rolls (its up is the world's up), so its screen-right lies on the ground plane, and facing is screen-up on that plane.
+    this.walkRight.set(1, 0, 0).applyQuaternion(this.camera().quaternion).setY(0);
+    if (this.walkRight.lengthSq() <= 1e-12) return;
+    this.walkRight.normalize();
+    this.walkForward.crossVectors(WALK_UP, this.walkRight);
+    const by = this.walk.step(step, this.walkForward, this.walkRight, this.controls.distance, this.walkStep);
+    this.controls.walkBy(by);
+  }
+
   /** Clip to a view's plan crop box (kernel mm), at every height. Null removes it. */
   setPlanCrop(crop: { min: { x: number; y: number }; max: { x: number; y: number } } | null) {
     this.sectionPlanes = crop
@@ -1456,6 +2072,7 @@ export class ModelViewer3D {
 
   private applyClipping() {
     this.renderer.clippingPlanes = [...(this.cutPlane ? [this.cutPlane] : []), ...this.sectionPlanes, ...this.cropBoxPlanes];
+    this.invalidateShadows();
     void this.fragments.update(true);
   }
 
@@ -1467,7 +2084,8 @@ export class ModelViewer3D {
    */
   setCropBox(box: CropBox3d | null, opts: { readonly crop: boolean; readonly show: boolean } = { crop: true, show: true }) {
     this.cropBox = box;
-    this.cropBoxPlanes = box && opts.crop ? cropBoxScenePlanes(box) : [];
+    // 3 mm outward render epsilon prevents GPU clipping-plane z-shredding on model faces lying flush on the crop box boundary.
+    this.cropBoxPlanes = box && opts.crop ? cropBoxScenePlanes(box, 3) : [];
     this.cropOutline.set(box && opts.show ? box : null);
     this.applyClipping();
     for (const listener of this.cameraListeners) listener();
@@ -1498,11 +2116,17 @@ export class ModelViewer3D {
   camera3dState(): View3dCamera | null {
     if (this.mode === "plan") return null;
     const camera = this.camera3d();
+    camera.updateMatrixWorld();
     const target = new THREE.Vector3();
     this.controls.getTarget(target);
+    // An off-centre orbit pin moves `controls.getTarget()` to the pivot while keeping the picture
+    // still via a focal offset. Project onto the camera's true viewing axis so saving and restoring
+    // (with the focal offset cleared) preserves the exact viewing direction on the first round trip.
+    const dist = Math.max(camera.position.distanceTo(target), 0.01);
+    const ahead = camera.position.clone().addScaledVector(camera.getWorldDirection(new THREE.Vector3()), dist);
     const k = (v: THREE.Vector3) => ({ x: v.x / MM, y: -v.z / MM, z: v.y / MM });
     const ortho = this.orthoView;
-    return { eye: k(camera.position), target: k(target), up: { x: 0, y: 0, z: 1 }, fovDeg: this.perspective.fov, orthoHeightMm: (ortho.top - ortho.bottom) / ortho.zoom / MM };
+    return { eye: k(camera.position), target: k(ahead), up: { x: 0, y: 0, z: 1 }, fovDeg: this.perspective.fov, orthoHeightMm: (ortho.top - ortho.bottom) / ortho.zoom / MM };
   }
 
   /** Where the plan camera looks and how far it is zoomed; null outside plan. `setPlanCamera` puts it back. */
@@ -1532,15 +2156,33 @@ export class ModelViewer3D {
     const s = (q: View3dCamera["eye"]) => new THREE.Vector3(q.x * MM, q.z * MM, -q.y * MM);
     const eye = s(camera.eye);
     const target = s(camera.target);
-    if (Math.abs(this.perspective.fov - camera.fovDeg) > 1e-6) {
-      this.perspective.fov = camera.fovDeg;
+    const clampedFov = Math.min(120, Math.max(5, camera.fovDeg));
+    const fovChanged = Math.abs(this.perspective.fov - clampedFov) > 1e-6;
+    if (fovChanged) {
+      this.perspective.fov = clampedFov;
       this.perspective.updateProjectionMatrix();
+      this.fovDirty = false;
     }
     const moving = this.controls.setLookAt(eye.x, eye.y, eye.z, target.x, target.y, target.z, animate);
     const cam = this.camera3d();
     if (cam instanceof THREE.OrthographicCamera) {
       await Promise.all([moving, this.controls.zoomTo((cam.top - cam.bottom) / Math.max(1e-6, camera.orthoHeightMm * MM), animate)]);
     } else await moving;
+    // The plan conversion may have left a focal offset behind (a pinned orbit point kept its
+    // screen place): setLookAt does not clear one, so the restored view would aim off its
+    // target and read as a small turn. Clear it and let it apply before re-pinning, because
+    // setOrbitPoint keeps the point where it currently sits on screen. The saved camera is
+    // the truth; the pin follows it.
+    this.controls.setFocalOffset(0, 0, 0, false);
+    this.controls.update(0);
+    if (this.orbitPointPinned) {
+      pinOrbitPoint(this.controls, target);
+      this.controls.update(0);
+    }
+    if (fovChanged) {
+      for (const listener of this.cameraListeners) listener();
+      for (const listener of this.cameraSettledListeners) listener();
+    }
     await this.fragments.update(true);
   }
 
@@ -1790,7 +2432,14 @@ export class ModelViewer3D {
   setOriginGizmo(position: Vec3Tuple, visible: boolean) {
     this.origin.position.set(...position);
     this.origin.visible = visible;
+    this.originAxes.position.set(...position);
+    this.originAxes.visible = visible && this.mode === "3d";
     for (const listener of this.cameraListeners) listener();
+  }
+
+  /** True when the 3D viewport renders depth-aware origin axis lines (dimmed behind building geometry). */
+  usesDepthAwareOriginAxes(): boolean {
+    return this.mode === "3d";
   }
 
   /** Where the origin marker and its axis lines are on the canvas (px from its top-left); null while hidden. */
@@ -2270,6 +2919,14 @@ export class ModelViewer3D {
     this.controls.setPointerBlocked(this.pointerClaims.size > 0);
   }
 
+  /** Display or clear a trade-agnostic 3D false-color scalar heatmap overlay over floors/workplanes. */
+  setScalarHeatmap(overlay: ScalarHeatmapOverlay | null): void {
+    disposeObject(this.scalarHeatmapRoot);
+    this.scalarHeatmapRoot.clear();
+    if (!overlay || overlay.cells.length === 0) return;
+    this.scalarHeatmapRoot.add(buildScalarHeatmapGroup(overlay));
+  }
+
   dispose() {
     if (this.planFootprintsIdle) {
       if (this.planFootprintsIdle.idle) window.cancelIdleCallback(this.planFootprintsIdle.id);
@@ -2277,6 +2934,11 @@ export class ModelViewer3D {
       this.planFootprintsIdle = null;
     }
     this.disposed = true;
+    this.releaseCameraMode();
+    this.cameraModeListeners.clear();
+    this.stopWalkOnBlur();
+    this.walkListeners.clear();
+    this.walkSpeedListeners.clear();
     this.surfacePicker.dispose();
     this.renderer.setAnimationLoop(null);
     this.resizeObserver.disconnect();
@@ -2285,10 +2947,13 @@ export class ModelViewer3D {
     disposeObject(this.ghostRoot);
     disposeObject(this.joinRoot);
     disposeObject(this.planSymbolRoot);
+    disposeObject(this.scalarHeatmapRoot);
+    this.lightingController?.dispose();
     disposeObject(this.selectedRoot);
     this.planSymbolMaterial?.dispose();
     for (const { texture } of this.planTextTextures.values()) texture.dispose();
     this.planTextTextures.clear();
+    disposeObject(this.originAxes);
     disposeObject(this.origin);
     this.cropOutline.dispose();
     if (this.markerMaterials) {
@@ -2299,10 +2964,23 @@ export class ModelViewer3D {
     }
     for (const entry of this.toneMaterials.values()) entry.material.dispose();
     this.dashedEdge?.dispose();
+    disposeEnvironmentTexture(this.studioEnv);
+    this.studioEnv = null;
+    this.sunLight?.shadow.map?.dispose();
     this.palette.dispose();
     void this.fragments.dispose();
+    const canvasEl = this.renderer.domElement;
+    canvasEl.removeEventListener("webglcontextlost", this.onContextLostHandler);
+    canvasEl.removeEventListener("webglcontextrestored", this.onContextRestoredHandler);
+    if (typeof document !== "undefined") {
+      document.removeEventListener("visibilitychange", this.onVisibilityChangeHandler);
+    }
     this.renderer.dispose();
-    this.renderer.domElement.remove();
+    // Avoid calling forceContextLoss() on routine unmount/HMR — synchronous WEBGL_lose_context trips
+    // macOS Chrome ANGLE/Metal GPU process crashes. Shrink the detached backing store cleanly instead.
+    canvasEl.width = 0;
+    canvasEl.height = 0;
+    canvasEl.remove();
   }
 }
 

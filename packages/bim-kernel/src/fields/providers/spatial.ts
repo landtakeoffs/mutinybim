@@ -32,8 +32,8 @@ export function roomText(r: Room): string | null {
   return textOrNull([r.number, r.name].filter((s) => s.trim() !== "").join(" "));
 }
 
-/** Kinds whose edit can move another element's answer (a level, the rooms, an opening's wall, a load point's run): an edit touching one rebuilds the index. */
-const SHAPING_KINDS: ReadonlySet<BimElement["kind"]> = new Set(["level", "room", "wall", "run_segment", "run_fitting"]);
+/** Kinds whose edit can move another element's answer (a level, the rooms/spaces, an opening's wall, a load point's run): an edit touching one rebuilds the index. */
+const SHAPING_KINDS: ReadonlySet<BimElement["kind"]> = new Set(["level", "room", "space", "wall", "run_segment", "run_fitting"]);
 
 type Inverse = ReadonlyMap<string, readonly ElementId[]>;
 
@@ -120,7 +120,11 @@ const inRoom: RelationshipResolver = (el, ctx) => {
 
 // ---------------------------------------------------------------- base fields
 
-const markOf = (el: BimElement): string | null => ("mark" in el && typeof el.mark === "string" ? textOrNull(el.mark) : null);
+const markOf = (el: BimElement): string | null => {
+  if ("mark" in el && typeof el.mark === "string") return textOrNull(el.mark);
+  if (el.kind !== "load_point" && "values" in el && el.values && typeof el.values.mark === "string") return textOrNull(el.values.mark);
+  return null;
+};
 
 function typeNameOf(elements: Elements, el: BimElement): string | null {
   if (el.kind === "part") {
@@ -131,6 +135,12 @@ function typeNameOf(elements: Elements, el: BimElement): string | null {
   if (el.kind === "beam") return textOrNull(el.sectionName);
   if ("typeName" in el && typeof el.typeName === "string") return textOrNull(el.typeName);
   return null;
+}
+
+function typeMarkOf(elements: Elements, el: BimElement): string | null {
+  if (el.kind !== "part") return null;
+  const t = elements[el.typeId];
+  return t?.kind === "part_type" ? textOrNull(t.definition.typeMark) : null;
 }
 
 function familyOf(elements: Elements, el: BimElement): string | null {
@@ -157,6 +167,7 @@ function baseFields(registry: Registry, roots: readonly ClassId[]): ProviderFiel
     const read = (f: (elements: Elements, el: BimElement) => string | null): FieldReader => (el, ctx) => f(ctx.elements, el);
     out.push(
       { path: "mark", label: "Mark", classes, valueType: "text", writer: markWriter(registry, root), group: "Identity", read: (el) => markOf(el) },
+      { path: "type_mark", label: "Type Mark", classes, valueType: "text", writer: locked("Edit the part type to change its Type Mark."), deps: { elementKinds: ["part_type"] }, group: "Identity", read: read(typeMarkOf) },
       { path: "type_name", label: "Type", classes, valueType: "text", writer: locked("Change its type to change this."), deps: { elementKinds: ["part_type"] }, group: "Identity", read: read(typeNameOf) },
       { path: "family", label: "Family", classes, valueType: "text", writer: locked("Change its type to change this."), deps: { elementKinds: ["part_type"] }, group: "Identity", read: read(familyOf) },
       { path: "level", label: "Level", classes, valueType: "text", writer: locked(MOVE_LEVEL), deps: { elementKinds: ["level"] }, group: "Location", read: read((els, el) => textOrNull(levelOf(els, el)?.name)) },
@@ -166,7 +177,7 @@ function baseFields(registry: Registry, roots: readonly ClassId[]): ProviderFiel
         classes,
         valueType: "text",
         writer: locked(ROOMS, "in_room"),
-        deps: { elementKinds: ["room"] },
+        deps: { elementKinds: ["room", "space"] },
         group: "Location",
         read: read((els, el) => {
           const r = roomOf(els, el);

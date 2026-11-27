@@ -1,5 +1,6 @@
-import { hostLineOf, hostVoidRow, type BimElement, type ClassSolidPart, type ClassSolidsRow, type KindSolidContext, type Vec2 } from "@permitzip/bim-kernel";
-import { DOOR_OPERATION_KEY } from "./graphics";
+import { hostLineOf, hostVoidRow, wallBaseAtMm, type BimElement, type ClassSolidPart, type ClassSolidsRow, type KindSolidContext, type Vec2 } from "@permitzip/bim-kernel";
+import { resolveDoorOperation, resolveDoorSide, WINDOW_PARTITIONING_KEY } from "./graphics";
+import { railingClassParts } from "./railing";
 import { valueOf } from "./values";
 
 /**
@@ -14,8 +15,6 @@ import { valueOf } from "./values";
 
 /** The type's frame depth across the wall, mm; absent: the wall's thickness. */
 export const FRAME_DEPTH_KEY = "architecture.frame_depth";
-/** The opening's side, as `create_hosted` stores it (-1: the wall's right). */
-const HOST_SIDE_KEY = "host.side";
 
 /** Jamb and head face width, mm. */
 const FRAME_FACE_MM = 50;
@@ -74,7 +73,8 @@ function holeOf(el: BimElement, ctx: KindSolidContext): Hole | null {
   const u = { x: dx / len, y: dy / len };
   const wallMm = line.widthMm > 0 ? line.widthMm : FRAME_FACE_MM * 2;
   const frameMm = Math.min(positive(valueOf(el, ctx.elements, FRAME_DEPTH_KEY)) ?? wallMm, wallMm + 2 * SILL_PROUD_MM);
-  return { start: line.start, u, n: { x: -u.y, y: u.x }, a, b, lo: ctx.floorMm + lo, hi: ctx.floorMm + hi, wallMm, frameMm, side: valueOf(el, ctx.elements, HOST_SIDE_KEY) === -1 ? -1 : 1 };
+  const hostBaseMm = host ? wallBaseAtMm(host, (a + b) / 2) : 0;
+  return { start: line.start, u, n: { x: -u.y, y: u.x }, a, b, lo: ctx.floorMm + hostBaseMm + lo, hi: ctx.floorMm + hostBaseMm + hi, wallMm, frameMm, side: resolveDoorSide(el, ctx.elements) };
 }
 
 /** A box in the wall: `s0..s1` along it, `d0..d1` across it from its centreline (toward its left), `z0..z1` up. */
@@ -101,13 +101,79 @@ export const DOOR_BODY: ClassSolidsRow = {
     if (!h) return null;
     const out: ClassSolidPart[] = [];
     frame(h, h.lo, out);
-    const op = String(valueOf(el, ctx.elements, DOOR_OPERATION_KEY) ?? "SINGLE_SWING_LEFT");
+    const op = resolveDoorOperation(el, ctx.elements);
     const face = (h.side * h.frameMm) / 2;
-    const [d0, d1] = op.includes("SLIDING") ? [-LEAF_MM / 2, LEAF_MM / 2] : [Math.min(face, face - h.side * LEAF_MM), Math.max(face, face - h.side * LEAF_MM)];
+    const centered = op.includes("SLIDING") || op === "DOUBLE_SWING_LEFT" || op === "DOUBLE_SWING_RIGHT" || op === "DOUBLE_DOOR_DOUBLE_SWING" || op === "REVOLVING";
+    const [d0, d1] = centered ? [-LEAF_MM / 2, LEAF_MM / 2] : [Math.min(face, face - h.side * LEAF_MM), Math.max(face, face - h.side * LEAF_MM)];
     const s0 = h.a + FRAME_FACE_MM;
     const s1 = h.b - FRAME_FACE_MM;
     const top = h.hi - FRAME_FACE_MM;
-    if (op.startsWith("DOUBLE_")) {
+    if (op.includes("SLIDING")) {
+      // Glazed sliding door leaves: framed stiles/rails + clear vision glass
+      const mid = (s0 + s1) / 2;
+      const stile = 60;
+      for (const [a, b, off] of [
+        [s0, mid + 20, -LEAF_MM * 0.45],
+        [mid - 20, s1, LEAF_MM * 0.45],
+      ] as const) {
+        const l0 = off - LEAF_MM / 2;
+        const l1 = off + LEAF_MM / 2;
+        out.push(box(h, a, a + stile, l0, l1, h.lo, top));
+        out.push(box(h, b - stile, b, l0, l1, h.lo, top));
+        out.push(box(h, a + stile, b - stile, l0, l1, h.lo, h.lo + 120));
+        out.push(box(h, a + stile, b - stile, l0, l1, top - stile, top));
+        if (b - a > 2 * stile + 20 && top - h.lo > 200) {
+          out.push(box(h, a + stile, b - stile, off - GLASS_MM / 2, off + GLASS_MM / 2, h.lo + 120, top - stile, "glazing"));
+        }
+      }
+    } else if (op === "ROLLINGUP") {
+      // Ribbed sectional overhead / garage door with horizontal panel rails and top vision lites
+      const panels = 4;
+      const panelH = (top - h.lo) / panels;
+      for (let i = 0; i < panels; i++) {
+        const z0 = h.lo + i * panelH;
+        const z1 = z0 + panelH - 6;
+        if (i === panels - 1 && panelH > 300) {
+          const stile = 120;
+          out.push(box(h, s0, s0 + stile, d0, d1, z0, z1));
+          out.push(box(h, s1 - stile, s1, d0, d1, z0, z1));
+          out.push(box(h, s0 + stile, s1 - stile, d0, d1, z0, z0 + 70));
+          out.push(box(h, s0 + stile, s1 - stile, d0, d1, z1 - 70, z1));
+          out.push(box(h, s0 + stile, s1 - stile, (d0 + d1) / 2 - GLASS_MM / 2, (d0 + d1) / 2 + GLASS_MM / 2, z0 + 70, z1 - 70, "glazing"));
+        } else {
+          out.push(box(h, s0, s1, d0, d1, z0, z1));
+        }
+      }
+    } else if (op.includes("FOLDING")) {
+      // Multi-panel bi-fold door leaves with narrow reveal gaps between panels
+      const count = op === "DOUBLE_DOOR_FOLDING" ? 4 : 2;
+      const panelW = (s1 - s0) / count;
+      for (let i = 0; i < count; i++) {
+        const a = s0 + i * panelW + (i === 0 ? 0 : LEAF_GAP_MM / 2);
+        const b = s0 + (i + 1) * panelW - (i === count - 1 ? 0 : LEAF_GAP_MM / 2);
+        out.push(box(h, a, b, d0, d1, h.lo, top));
+      }
+    } else if (op === "REVOLVING") {
+      // Revolving door: center hub shaft + crossed wings spanning the vestibule
+      const mid = (s0 + s1) / 2;
+      const r = Math.max(150, (s1 - s0) / 2);
+      const hub = 45;
+      out.push(box(h, mid - hub, mid + hub, -hub, hub, h.lo, top));
+      out.push(box(h, mid - r, mid + r, -GLASS_MM / 2, GLASS_MM / 2, h.lo + 80, top - 80, "glazing"));
+      out.push(box(h, mid - GLASS_MM / 2, mid + GLASS_MM / 2, -r, r, h.lo + 80, top - 80, "glazing"));
+    } else if (op === "SWING_FIXED_LEFT" || op === "SWING_FIXED_RIGHT") {
+      // Active swinging leaf (60%) + vertical mullion + glazed fixed sidelite (40%)
+      const clear = s1 - s0;
+      const split = op === "SWING_FIXED_LEFT" ? s0 + clear * 0.6 : s1 - clear * 0.6;
+      const mul = 40;
+      out.push(box(h, split - mul / 2, split + mul / 2, -h.frameMm / 2, h.frameMm / 2, h.lo, top));
+      const [actA, actB, fixA, fixB] = op === "SWING_FIXED_LEFT" ? [s0, split - mul / 2, split + mul / 2, s1] : [split + mul / 2, s1, s0, split - mul / 2];
+      out.push(box(h, actA, actB, d0, d1, h.lo, top));
+      if (fixB - fixA > 40) {
+        out.push(box(h, fixA, fixB, -GLASS_MM / 2, GLASS_MM / 2, h.lo + 80, top - 40, "glazing"));
+        out.push(box(h, fixA, fixB, -LEAF_MM / 2, LEAF_MM / 2, h.lo, h.lo + 80));
+      }
+    } else if (op.startsWith("DOUBLE_DOOR")) {
       const mid = (s0 + s1) / 2;
       out.push(box(h, s0, mid - LEAF_GAP_MM / 2, d0, d1, h.lo, top));
       out.push(box(h, mid + LEAF_GAP_MM / 2, s1, d0, d1, h.lo, top));
@@ -120,7 +186,7 @@ export const DOOR_BODY: ClassSolidsRow = {
 
 export const WINDOW_BODY: ClassSolidsRow = {
   classId: "arch.window",
-  label: "Window frame, sill and glass",
+  label: "Window frame, sill, mullions and glass",
   solids(el, ctx) {
     const h = holeOf(el, ctx);
     if (!h) return null;
@@ -132,9 +198,47 @@ export const WINDOW_BODY: ClassSolidsRow = {
     const d = h.frameMm / 2;
     const f = FRAME_FACE_MM;
     out.push(box(h, h.a + f, h.b - f, -d, d, sillTop, sillTop + f));
-    if (h.hi - f > sillTop + f) out.push(box(h, h.a + f, h.b - f, -GLASS_MM / 2, GLASS_MM / 2, sillTop + f, h.hi - f, "glazing"));
+    const zBot = sillTop + f;
+    const zTop = h.hi - f;
+    const s0 = h.a + f;
+    const s1 = h.b - f;
+    if (zTop > zBot) {
+      const part = String(valueOf(el, ctx.elements, WINDOW_PARTITIONING_KEY) ?? "SINGLE_PANEL");
+      const mul = 36;
+      const mulD = Math.min(d, 38);
+      if (part === "DOUBLE_PANEL_VERTICAL" || part === "TRIPLE_PANEL_VERTICAL") {
+        const count = part === "TRIPLE_PANEL_VERTICAL" ? 3 : 2;
+        for (let i = 1; i < count; i++) {
+          const m = s0 + ((s1 - s0) * i) / count;
+          out.push(box(h, m - mul / 2, m + mul / 2, -mulD, mulD, zBot, zTop));
+        }
+        out.push(box(h, s0, s1, -GLASS_MM / 2, GLASS_MM / 2, zBot, zTop, "glazing"));
+      } else if (part === "DOUBLE_PANEL_HORIZONTAL") {
+        // Classic double-hung window: horizontal meeting rail + slightly offset upper/lower glazing panes
+        const zMid = (zBot + zTop) / 2;
+        out.push(box(h, s0, s1, -mulD, mulD, zMid - mul / 2, zMid + mul / 2));
+        out.push(box(h, s0, s1, -GLASS_MM / 2 - 12, GLASS_MM / 2 - 12, zBot, zMid - mul / 2, "glazing"));
+        out.push(box(h, s0, s1, -GLASS_MM / 2 + 12, GLASS_MM / 2 + 12, zMid + mul / 2, zTop, "glazing"));
+      } else if (part === "TRIPLE_PANEL_TOP" || part === "TRIPLE_PANEL_BOTTOM") {
+        const zBar = part === "TRIPLE_PANEL_TOP" ? zBot + (zTop - zBot) * 0.72 : zBot + (zTop - zBot) * 0.28;
+        const sMid = (s0 + s1) / 2;
+        out.push(box(h, s0, s1, -mulD, mulD, zBar - mul / 2, zBar + mul / 2));
+        out.push(box(h, sMid - mul / 2, sMid + mul / 2, -mulD, mulD, part === "TRIPLE_PANEL_TOP" ? zBot : zBar, part === "TRIPLE_PANEL_TOP" ? zBar : zTop));
+        out.push(box(h, s0, s1, -GLASS_MM / 2, GLASS_MM / 2, zBot, zTop, "glazing"));
+      } else {
+        out.push(box(h, s0, s1, -GLASS_MM / 2, GLASS_MM / 2, zBot, zTop, "glazing"));
+      }
+    }
     return out;
   },
 };
 
-export const ARCHITECTURE_BODIES: readonly ClassSolidsRow[] = [DOOR_BODY, WINDOW_BODY];
+export const RAILING_BODY: ClassSolidsRow = {
+  classId: "arch.railing",
+  label: "Railing posts, rails and infill",
+  solids(el, ctx) {
+    return railingClassParts(el, ctx);
+  },
+};
+
+export const ARCHITECTURE_BODIES: readonly ClassSolidsRow[] = [DOOR_BODY, WINDOW_BODY, RAILING_BODY];

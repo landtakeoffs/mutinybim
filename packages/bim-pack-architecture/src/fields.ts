@@ -1,6 +1,7 @@
 import { boundsRooms, OPENING_VOID_ROW, type BimElement, type FieldProvider, type FieldWriter, type Vec2 } from "@permitzip/bim-kernel";
 import { ARCHITECTURE_CLASSES } from "./classes";
-import { DOOR_OPERATION_KEY } from "./graphics";
+import { resolveDoorHanding, resolveDoorOperation, resolveDoorSide } from "./graphics";
+import { asRailing, railingCompliance, railingSpec } from "./railing";
 import { FIRE_RESISTANCE_RATING } from "./ratings";
 import { valueOf } from "./values";
 
@@ -92,7 +93,9 @@ export const ARCHITECTURE_FIELD_PROVIDER: FieldProvider = {
     { path: "function", label: "Wall function", classes: ["arch.wall"], valueType: "text", writer: locked("Set the wall function on the type."), group: "Identity", deps: READS_TYPE, read: (el, ctx) => enumWords(valueOf(el, ctx.elements, WALL_FUNCTION_KEY)) },
     { ...mmLength("total_thickness", "Total thickness", ["arch.wall"], () => null, locked("Set the total thickness on the type.")), deps: READS_TYPE, read: (el, ctx) => finite(valueOf(el, ctx.elements, TOTAL_THICKNESS_KEY)) ?? (el.kind === "wall" ? finite(el.thickness) : null) },
     { path: "bounds_rooms", label: "Room bounding", classes: ["arch.wall"], valueType: "boolean", writer: locked("Turn room bounding on or off in Properties."), group: "Identity", deps: READS_TYPE, read: (el, ctx) => (el.kind === "wall" ? boundsRooms(el, ctx.elements) : null) },
-    { path: "swing", label: "Swing", classes: ["arch.door"], valueType: "text", writer: locked("Set the door's operation on its type or in Properties."), group: "Identity", deps: READS_TYPE, read: (el, ctx) => enumWords(valueOf(el, ctx.elements, DOOR_OPERATION_KEY)) },
+    { path: "swing", label: "Swing", classes: ["arch.door"], valueType: "text", writer: locked("Set the door's operation on its type or in Properties."), group: "Identity", deps: READS_TYPE, read: (el, ctx) => enumWords(resolveDoorOperation(el, ctx.elements)) },
+    { path: "handing", label: "Handing", classes: ["arch.door"], valueType: "text", writer: locked("Set the door's operation, handing, or swing side in Properties."), group: "Identity", deps: READS_TYPE, read: (el, ctx) => resolveDoorHanding(el, ctx.elements) },
+    { path: "swing_side", label: "Swing side", classes: ["arch.door"], valueType: "text", writer: locked("Flip swing in Properties or set host.side / architecture.door_swing."), group: "Identity", deps: READS_TYPE, read: (el, ctx) => (resolveDoorSide(el, ctx.elements) === -1 ? "Outward (-1)" : "Inward (+1)") },
     { ...mmLength("sill", "Sill height", ["arch.door", "arch.window"], () => null, locked("Set the sill height on the type or in Properties.")), deps: READS_TYPE, read: (el, ctx) => finite(cutOf(el, ctx.elements)?.sill) },
     { ...mmLength("head", "Head height", ["arch.door", "arch.window"], () => null, locked("Change the sill height or the opening's height.")), deps: READS_TYPE, read: (el, ctx) => finite(cutOf(el, ctx.elements)?.head) },
     mmLength("length", "Length", ["arch.wall"], (el) => (el.kind === "wall" ? dist(el.start, el.end) : null), locked("Drag the wall's ends.")),
@@ -105,5 +108,10 @@ export const ARCHITECTURE_FIELD_PROVIDER: FieldProvider = {
     { path: "number", label: "Room number", classes: ["arch.room"], valueType: "text", writer: locked("Rename the room in the model."), group: "Identity", read: (el) => (el.kind === "room" ? textOrNull(el.number) : null) },
     { path: "name", label: "Room name", classes: ["arch.room"], valueType: "text", writer: locked("Rename the room in the model."), group: "Identity", read: (el) => (el.kind === "room" ? textOrNull(el.name) : null) },
     { path: "area", label: "Area", classes: ["arch.room"], valueType: "quantity", kind: "area", unit: "m2", writer: locked("Edit the room's outline."), group: "Dimensions", read: (el) => (el.kind === "room" ? finite(el.areaSqM) : null) },
+    { ...mmLength("length", "Length", ["arch.railing"], () => null, locked("Edit the railing path in the model.")), deps: READS_TYPE, read: (el, ctx) => { const r = asRailing(el); return r ? railingSpec(r, ctx.elements).lengthMm : null; } },
+    { ...mmLength("height", "Height", ["arch.railing"], () => null, locked("Set guard height in Properties.")), deps: READS_TYPE, read: (el, ctx) => { const r = asRailing(el); return r ? railingSpec(r, ctx.elements).heightMm : null; } },
+    { path: "railing_style", label: "Railing style", classes: ["arch.railing"], valueType: "text", writer: locked("Pick a railing style in Properties."), group: "Identity", deps: READS_TYPE, read: (el, ctx) => { const r = asRailing(el); return r ? enumWords(railingSpec(r, ctx.elements).style) : null; } },
+    { path: "railing_posts", label: "Posts", classes: ["arch.railing"], valueType: "text", writer: locked("Computed from railing length and post spacing."), group: "Dimensions", deps: READS_TYPE, read: (el, ctx) => { const r = asRailing(el); return r ? String(railingSpec(r, ctx.elements).postCount) : null; } },
+    { path: "railing_compliant", label: "IBC guard compliant", classes: ["arch.railing"], valueType: "boolean", writer: locked("Computed against IBC 1015.3 (42\") and IBC 1015.4 (4\" sphere)."), group: "Ratings", deps: READS_TYPE, read: (el, ctx) => { const r = asRailing(el); return r ? railingCompliance(r, ctx.elements).compliant : null; } },
   ],
 };

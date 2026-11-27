@@ -19,6 +19,7 @@ import { sectionById, type WideFlangeSection } from "./sections";
 /** Parameter keys the pack reads and writes. */
 export const STRUCT_KEYS = {
   section: "struct.section",
+  elasticModulus: "struct.elastic_modulus",
   occupancy: "struct.occupancy",
   /** The baseline Structural set's operating weight (bim-library parameter-sets.ts), stored on the part as `weight` in pounds. */
   operatingWeight: "struct.operating_weight",
@@ -41,6 +42,8 @@ export interface FrameBeam {
   readonly endZMm: number;
   readonly sectionName: string;
   readonly section: WideFlangeSection | null;
+  /** Explicit modulus of elasticity E read from the beam or its type (`struct.elastic_modulus`, ksi); null when absent (never defaulted). */
+  readonly elasticModulus: Quantity<"stress"> | null;
 }
 
 /** A column as a support: where it stands and what it reaches, without its section. */
@@ -169,12 +172,26 @@ function readColumn(levels: readonly LevelRow[], placementOf: PlacementOf, c: Co
   const z0 = at.z0;
   const radiusMm = Math.max(c.size.x, c.size.y) / 2;
   if (p.kind === "line") {
-    const top = p.topLevelId ? levels.find((l) => l.id === p.topLevelId)?.elevationMm ?? null : null;
-    return { id: c.id, label: nameOf(c, c.id), levelId: p.levelId, position: c.position, radiusMm, baseZMm: z0 + Math.min(p.startOffsetMm, p.endOffsetMm), topZMm: top ?? z0 + Math.max(p.startOffsetMm, p.endOffsetMm), topLevelId: p.topLevelId ?? null };
+    const topLvl = p.topLevelId ? levels.find((l) => l.id === p.topLevelId) ?? null : null;
+    const baseZMm = z0 + Math.min(p.startOffsetMm, p.endOffsetMm);
+    const topZMm = topLvl !== null ? topLvl.elevationMm + (p.topOffsetMm ?? 0) : typeof c.height === "number" && c.height > 0 ? baseZMm + c.height : z0 + Math.max(p.startOffsetMm, p.endOffsetMm);
+    return { id: c.id, label: nameOf(c, c.id), levelId: p.levelId, position: c.position, radiusMm, baseZMm, topZMm, topLevelId: topLvl?.id ?? p.topLevelId ?? null };
   }
-  // A point-placed column runs from its level to the next level up.
+  const baseZMm = z0 + p.offsetMm;
+  if (p.topLevelId !== undefined) {
+    const topLvl = levels.find((l) => l.id === p.topLevelId) ?? null;
+    if (topLvl !== null) {
+      return { id: c.id, label: nameOf(c, c.id), levelId: p.levelId, position: c.position, radiusMm, baseZMm, topZMm: topLvl.elevationMm + (p.topOffsetMm ?? 0), topLevelId: topLvl.id };
+    }
+  }
+  if (typeof c.height === "number" && Number.isFinite(c.height) && c.height > 0) {
+    const topZMm = baseZMm + c.height;
+    const topLvl = levels.find((l) => Math.abs(l.elevationMm - topZMm) <= 50) ?? null;
+    return { id: c.id, label: nameOf(c, c.id), levelId: p.levelId, position: c.position, radiusMm, baseZMm, topZMm, topLevelId: topLvl?.id ?? null };
+  }
+  // A point-placed column with no explicit height or top level runs from its level to the next level up.
   const above = levelAbove(levels, z0);
-  return { id: c.id, label: nameOf(c, c.id), levelId: p.levelId, position: c.position, radiusMm, baseZMm: z0 + p.offsetMm, topZMm: above?.elevationMm ?? z0 + p.offsetMm, topLevelId: above?.id ?? null };
+  return { id: c.id, label: nameOf(c, c.id), levelId: p.levelId, position: c.position, radiusMm, baseZMm, topZMm: above?.elevationMm ?? baseZMm, topLevelId: above?.id ?? null };
 }
 
 const isFooting = (k: ComponentElement) => k.category === "footing" || k.classId === "struct.footing_pad";
@@ -206,7 +223,9 @@ function read(elements: Elements): Frame {
       continue;
     }
     const sectionName = typedText(elements, b, STRUCT_KEYS.section) ?? b.sectionName;
-    beams.push({ id: b.id, label: nameOf(b, b.id), levelId: p.levelId, start: b.start, end: b.end, startZMm: at.z0 + p.startOffsetMm, endZMm: at.z0 + p.endOffsetMm, sectionName, section: sectionById(sectionName) });
+    const rawE = elementTypeValue(elements, b, STRUCT_KEYS.elasticModulus);
+    const elasticModulus = typeof rawE === "number" && Number.isFinite(rawE) && rawE > 0 ? qty("stress", rawE, "ksi") : null;
+    beams.push({ id: b.id, label: nameOf(b, b.id), levelId: p.levelId, start: b.start, end: b.end, startZMm: at.z0 + p.startOffsetMm, endZMm: at.z0 + p.endOffsetMm, sectionName, section: sectionById(sectionName), elasticModulus });
   }
 
   for (const c of elementsOfKind(elements, "column")) {
@@ -240,7 +259,8 @@ function read(elements: Elements): Frame {
 
   for (const part of elementsOfKind(elements, "part")) {
     const type = elements[part.typeId];
-    const raw = type?.kind === "part_type" ? paramValue(type.definition, part.values, OPERATING_WEIGHT_STORAGE.name) : part.values[OPERATING_WEIGHT_STORAGE.name];
+    const readWeight = (key: string) => (type?.kind === "part_type" ? paramValue(type.definition, part.values, key) : part.values[key]);
+    const raw = readWeight(OPERATING_WEIGHT_STORAGE.name) ?? readWeight("operating_weight") ?? readWeight(STRUCT_KEYS.operatingWeight);
     if (typeof raw !== "number" || !Number.isFinite(raw) || raw <= 0) continue;
     // Mass in pounds times standard gravity: the weight in newtons.
     const weight = fromCanonical("force", qty("mass", raw, OPERATING_WEIGHT_STORAGE.unit) * STANDARD_GRAVITY);

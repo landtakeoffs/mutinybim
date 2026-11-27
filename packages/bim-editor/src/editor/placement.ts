@@ -1,10 +1,12 @@
-import { MODEL_FRAME, elementsOfKind, fromWorkFrame, mountingPlaneUnder, paperToModelPoint, toWorkFrame, viewModelLevel, type BimElement, type Command, type Level, type ModelState, type PartCategory, type PartInstance, type PartTypeDefinition, type ReferenceSnapCandidates, type Vec2, type ViewOnPaper, type WorkFrame } from '@permitzip/bim-kernel'
+import { MODEL_FRAME, elementsOfKind, fromWorkFrame, isWallFaceMountable, mountingPlaneUnder, nearestWallFace, paperToModelPoint, toWorkFrame, viewModelLevel, type BimElement, type Command, type Level, type ModelState, type PartCategory, type PartHost, type PartInstance, type PartTypeDefinition, type ReferenceSnapCandidates, type Vec2, type ViewOnPaper, type WorkFrame } from '@permitzip/bim-kernel'
 
 /**
  * Placement helpers for the Building Model tools: where a part lands under
  * the pointer (grid, other parts, the architect's model), default heights,
  * and the plain words shown while placing. Pure: no React, no three.js.
  */
+
+export { isWallFaceMountable }
 
 export const MM_PER_FT = 304.8
 export const MM_PER_IN = 25.4
@@ -15,6 +17,8 @@ export const GRID_MM = 6 * MM_PER_IN
 export const POINT_SNAP_MM = 300
 /** How close (plan mm) to another part's x or y to line up with it. */
 export const ALIGN_SNAP_MM = 150
+/** How close (plan mm) to a wall finish face a wall-mounted part snaps flush onto it. */
+export const WALL_FACE_SNAP_MM = 450
 
 export type SnapKind = 'part' | 'align' | 'reference' | 'linked' | 'grid'
 
@@ -100,6 +104,47 @@ export function snapPoint(raw: Vec2, targets: readonly SnapTarget[], reference: 
   const point = fromWorkFrame(frame, { x, y })
   if (labels.length > 0) return { point, kind: 'align', label: labels.join(' and ') }
   return { point, kind: 'grid', label: frame.angleDeg === 0 ? '6" grid' : '6" grid along the working angle' }
+}
+
+/** A linked model's wall finish face within `maxDistanceMm`, with outward room-facing `rotationDeg` so wall-hosted parts auto-orient onto IFC walls just like native walls. */
+export function nearestLinkedWallFace(
+  raw: Vec2,
+  linked: ReferenceSnapCandidates | null | undefined,
+  maxDistanceMm = WALL_FACE_SNAP_MM,
+): { readonly position: Vec2; readonly rotationDeg: number; readonly label: string } | null {
+  if (!linked || linked.lines.length === 0) return null
+  // Prefer explicit wall face lines (`kind === 'face'`); fall back to outline segments if none are nearby.
+  let best: { readonly position: Vec2; readonly rotationDeg: number; readonly label: string; readonly d: number; readonly priority: number } | null = null
+  for (const l of linked.lines) {
+    const priority = l.kind === 'face' ? 0 : l.kind === 'edge' ? 1 : 2
+    if (priority > 1) continue
+    const dx = l.end.x - l.start.x
+    const dy = l.end.y - l.start.y
+    const len2 = dx * dx + dy * dy
+    if (len2 < 1e-3) continue
+    const t = Math.max(0, Math.min(1, ((raw.x - l.start.x) * dx + (raw.y - l.start.y) * dy) / len2))
+    const q = { x: l.start.x + dx * t, y: l.start.y + dy * t }
+    const d = Math.hypot(raw.x - q.x, raw.y - q.y)
+    if (d > maxDistanceMm) continue
+    if (best && (priority > best.priority || (priority === best.priority && d >= best.d))) continue
+    // Wall local +X runs along the wall; local +Y points outward into the room (towards the pointer side).
+    const len = Math.sqrt(len2)
+    const tx = dx / len
+    const ty = dy / len
+    // Left normal (-ty, tx); if pointer lies on the opposite side, flip wall direction 180° so +Y faces the pointer.
+    const cross = -ty * (raw.x - q.x) + tx * (raw.y - q.y)
+    const dirX = cross >= 0 ? tx : -tx
+    const dirY = cross >= 0 ? ty : -ty
+    const angleDeg = ((Math.atan2(dirY, dirX) * 180) / Math.PI + 360) % 360
+    best = {
+      position: { x: Math.round(q.x), y: Math.round(q.y) },
+      rotationDeg: Math.round(angleDeg * 10) / 10,
+      label: l.label || 'linked IFC wall face',
+      d,
+      priority,
+    }
+  }
+  return best ? { position: best.position, rotationDeg: best.rotationDeg, label: best.label } : null
 }
 
 /** A linked model's end or corner within the point reach, else the nearest face or centre line within the line-up reach. */
@@ -245,6 +290,10 @@ export interface DrawingPlacementTarget {
   readonly levelId: string
   readonly position: Vec2
   readonly offsetMm: number
+  /** Automatic facing rotation when snapped flush to a wall face; absent: use the tool's rotation. */
+  readonly rotationDeg?: number
+  /** The wall face (or other host) the part mounts on so it follows future host edits. */
+  readonly host?: PartHost
   /** The mounting plane under the pointer the part goes on (it moves with the plane); absent: on the level. */
   readonly planeId?: string
   /** In words, for the status line ("On Level 1, 1'-6\" up, on the 6\" grid"). */
@@ -260,7 +309,7 @@ export type DrawingPlacement = { readonly ok: true; readonly target: DrawingPlac
  * the level (the highest one at or below it) and the height above it; the plan
  * point is on the cut line. Never switches view.
  */
-export function drawingPlacementTarget(model: ModelState, vop: ViewOnPaper, paper: Vec2, heightMm: number, frame: WorkFrame = MODEL_FRAME, opts: { readonly ignorePlanes?: boolean; /** A linked model's snap candidates near a plan point on a level. */ readonly linked?: (levelId: string, at: Vec2) => ReferenceSnapCandidates | null } = {}): DrawingPlacement {
+export function drawingPlacementTarget(model: ModelState, vop: ViewOnPaper, paper: Vec2, heightMm: number, frame: WorkFrame = MODEL_FRAME, opts: { readonly ignorePlanes?: boolean; /** Snap flush onto a nearby wall's finish face (with `wall_face` host + outward room rotation). */ readonly wallSnap?: boolean; /** A linked model's snap candidates near a plan point on a level. */ readonly linked?: (levelId: string, at: Vec2) => ReferenceSnapCandidates | null } = {}): DrawingPlacement {
   const mapping = vop.mapping
   if (mapping.modelReason) return { ok: false, reason: mapping.modelReason }
   const levels = levelsOf(model)
@@ -270,6 +319,35 @@ export function drawingPlacementTarget(model: ModelState, vop: ViewOnPaper, pape
     if (!level) return { ok: false, reason: `This plan's level (${vop.view.props?.level ?? 'none'}) isn't in the model; set the view's level in View properties.` }
     const at = paperToModelPoint(vop, paper, { elevationMm: level.elevationMm + heightMm })
     if (!at) return { ok: false, reason: 'Point inside the view to place it.' }
+    if (opts.wallSnap) {
+      const wallHit = nearestWallFace(model, level.id, { x: at.x, y: at.y }, { maxDistanceMm: WALL_FACE_SNAP_MM })
+      if (wallHit) {
+        return {
+          ok: true,
+          target: {
+            levelId: level.id,
+            position: wallHit.position,
+            offsetMm: Math.round(heightMm),
+            rotationDeg: wallHit.rotationDeg,
+            host: { kind: 'wall_face', elementId: wallHit.wallId, stationMm: wallHit.stationMm, side: wallHit.side },
+            where: `On ${level.name}, ${feetInches(heightMm)} up, flush on wall face (Shift: free placement)`,
+          },
+        }
+      }
+      const linkedWall = nearestLinkedWallFace({ x: at.x, y: at.y }, opts.linked?.(level.id, { x: at.x, y: at.y }), WALL_FACE_SNAP_MM)
+      if (linkedWall) {
+        return {
+          ok: true,
+          target: {
+            levelId: level.id,
+            position: linkedWall.position,
+            offsetMm: Math.round(heightMm),
+            rotationDeg: linkedWall.rotationDeg,
+            where: `On ${level.name}, ${feetInches(heightMm)} up, flush on ${linkedWall.label} (Shift: free placement)`,
+          },
+        }
+      }
+    }
     // A mounting plane on this level under the pointer is where the part goes (Shift: the level instead).
     const under = opts.ignorePlanes ? null : mountingPlaneUnder(model, (mm) => paperToModelPoint(vop, paper, { elevationMm: mm }), new Set([level.id]))
     if (under) {
@@ -300,8 +378,9 @@ export type DrawingPlacementSpec =
 
 /** The one command a click on the drawing sends. The new part's id is chosen once per click by the caller. */
 export function drawingPlacementCommand(spec: DrawingPlacementSpec, target: DrawingPlacementTarget, newPartId: string): Command {
+  const rotationDeg = target.rotationDeg ?? spec.rotationDeg
   if (spec.kind === 'planned') {
-    return { type: 'place_planned_part', partId: spec.partId, levelId: target.levelId, position: target.position, ...(target.planeId ? { planeId: target.planeId } : { offsetMm: target.offsetMm }), rotationDeg: spec.rotationDeg }
+    return { type: 'place_planned_part', partId: spec.partId, levelId: target.levelId, position: target.position, ...(target.planeId ? { planeId: target.planeId } : { offsetMm: target.offsetMm }), ...(target.host ? { host: target.host } : {}), rotationDeg }
   }
   return {
     type: 'place_part',
@@ -311,6 +390,7 @@ export function drawingPlacementCommand(spec: DrawingPlacementSpec, target: Draw
     levelId: target.levelId,
     position: target.position,
     ...(target.planeId ? { planeId: target.planeId } : { offsetMm: target.offsetMm }),
-    rotationDeg: spec.rotationDeg,
+    ...(target.host ? { host: target.host } : {}),
+    rotationDeg,
   }
 }

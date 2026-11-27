@@ -232,7 +232,8 @@ describe("sections are real cuts", () => {
   it("level datum lines carry their name and elevation; no outline disclaimer", () => {
     const { scene } = sectionLinesModel(sectionModel());
     const t = texts(scene.primitives).map((x) => x.text);
-    expect(t).toContain("LEVEL 1  EL. 0'-0\"");
+    expect(t).toContain("LEVEL 1");
+    expect(t).toContain("EL. 0'-0\"");
     expect(t.some((x) => x.startsWith("OUTLINE SECTION"))).toBe(false);
   });
 
@@ -272,11 +273,13 @@ describe("display settings change the drawing", () => {
     expect(coarse[0]).toBeCloseTo(((medium[0] ?? 0) + (medium[1] ?? 0)) / 2, 1);
   });
 
-  it("shaded fills the duct's top surface; shaded with edges adds its lines; wireframe and hidden line fill nothing", () => {
-    expect(fills(planLines({ visualStyle: "shaded" }).scene.primitives).length).toBeGreaterThan(0);
+  it("shaded fills the duct's top surface; shaded with edges adds its lines; hidden line emits only white paper masks; wireframe fills nothing", () => {
+    expect(fills(planLines({ visualStyle: "shaded" }).scene.primitives).filter((f) => f.grey < 1).length).toBeGreaterThan(0);
     expect(eastRows(planLines({ visualStyle: "shaded" }).ls)).toHaveLength(0);
     expect(eastRows(planLines({ visualStyle: "shaded_edges" }).ls)).toHaveLength(2);
-    expect(fills(planLines({ visualStyle: "hidden_line" }).scene.primitives)).toHaveLength(0);
+    const hiddenFills = fills(planLines({ visualStyle: "hidden_line" }).scene.primitives);
+    expect(hiddenFills.filter((f) => f.grey < 1)).toHaveLength(0);
+    expect(hiddenFills.length).toBeGreaterThan(0);
     expect(fills(planLines({ visualStyle: "wireframe" }).scene.primitives)).toHaveLength(0);
     // The SVG preview carries the same fills.
     expect(sceneToSvg(planLines({ visualStyle: "shaded" }).scene)).toContain("<polygon");

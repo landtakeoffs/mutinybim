@@ -4,7 +4,7 @@ import { FIRST_PARTY_PACK_IDS, PACK_READ_POINT, activePackSet, firstPartyPackNam
 import { scriptSourceIssues, type ScriptKind, type ScriptValue } from "@permitzip/bim-library";
 import type { ScriptDefinition } from "./define";
 import { deterministicId, seededRandom, type RunSeed } from "./determinism";
-import { MAX_SCRIPT_REPORT_BYTES, MAX_SCRIPT_REPORTS, chunkEdits, jsonBytes, stepRefusal, type EditStep, type ScriptOutput, type ScriptReport } from "./output";
+import { MAX_SCRIPT_RENDERS, MAX_SCRIPT_REPORT_BYTES, MAX_SCRIPT_REPORTS, chunkEdits, jsonBytes, stepRefusal, type EditStep, type ScriptOutput, type ScriptRenderRequest, type ScriptReport } from "./output";
 import { sliceAsModel, sliceReader, type ModelSlice, type SliceReader } from "./slice";
 import { bindWorking } from "./working";
 
@@ -63,6 +63,13 @@ export interface ScriptContext {
    * apply. If the run stops, what it reported so far is in the message.
    */
   report(label: string, value: unknown): void;
+  /**
+   * Queues a sheet or view PNG image to be rasterized by the host and attached
+   * directly to `bim_run_script`'s answer (up to 6 images per run). Pure
+   * declarative request inside the sealed script; use `markups.renderSheet` or
+   * `documents.renderSheet` for high-level helpers.
+   */
+  render(request: ScriptRenderRequest): void;
   /** The engineering calculations a script can run (code calcs, duct and pipe reports, service size). */
   calcs(): readonly ScriptCalcInfo[];
   /**
@@ -136,10 +143,12 @@ export async function runScript(definition: ScriptDefinition, input: RunScriptIn
   let counter = 0;
   let working: ModelState = sliceAsModel(input.slice);
   const steps: EditStep[] = [];
+  const touched = new Set<string>();
   const types: { typeId: string; definition: PartTypeDefinition }[] = [];
   const typeIds = new Set<string>();
   let label = "";
   const reports: ScriptReport[] = [];
+  const renders: ScriptRenderRequest[] = [];
   let reportBytes = 2;
   let reportsCut = false;
   const features = new Set(input.slice.features);
@@ -166,6 +175,16 @@ export async function runScript(definition: ScriptDefinition, input: RunScriptIn
       }
       reports.push(entry);
       reportBytes += bytes;
+    },
+    render(request) {
+      if (renders.length >= MAX_SCRIPT_RENDERS) {
+        throw new ScriptRunError(`A script can request at most ${MAX_SCRIPT_RENDERS} rendered images per run.`);
+      }
+      if (!request || (request.kind !== "sheet" && request.kind !== "view") || !request.targetId?.trim()) {
+        throw new ScriptRunError('ctx.render requires { kind: "sheet" | "view", targetId, label }.');
+      }
+      const cleanLabel = (request.label ?? "").trim().slice(0, 160) || `${request.kind} ${request.targetId}`;
+      renders.push({ ...request, targetId: request.targetId.trim(), label: cleanLabel });
     },
     calcs() {
       return withPackSet(input.packs, () => scriptCalcs.list()).map((c) => ({ id: c.id, title: c.title, domain: c.domain, summary: c.summary, readsModel: c.needsModel }));
@@ -216,6 +235,8 @@ export async function runScript(definition: ScriptDefinition, input: RunScriptIn
       const result = withPackSet(input.packs, () => withUpgradePolicy(serverReads, () => executeCommand(working, step)));
       if (!result.ok) throw new ScriptRunError(`Step ${n} (${command.type}) was refused: ${result.error.message}${missingTradesWords(input.slice)}`);
       working = result.model;
+      for (const id of result.changedIds) touched.add(id);
+      for (const id of result.removedIds) touched.delete(id);
       steps.push(step);
     },
     parts: {
@@ -227,23 +248,24 @@ export async function runScript(definition: ScriptDefinition, input: RunScriptIn
       },
     },
   };
-  bindWorking(ctx, { model: () => working, packs: input.packs });
+  bindWorking(ctx, { model: () => working, packs: input.packs, touchedIds: () => [...touched], features });
   try {
     await definition.runWith(ctx, input.values);
   } catch (err) {
     throw withReports(err, reports);
   }
   const report = reports.length > 0 ? { report: reports } : {};
+  const renderPart = renders.length > 0 ? { renders } : {};
   if (kind === "part") {
     if (types.length === 0) throw withReports(new ScriptRunError("The part script defined no part types."), reports);
-    return { kind: "part_types", types, ...report };
+    return { kind: "part_types", types, ...report, ...renderPart };
   }
   if (steps.length === 0) {
-    if (reports.length === 0) throw new ScriptRunError("The script made no edits. To see values without editing, ctx.report them.");
-    return { kind: "edits", label: label || "Nothing changed: reports only", steps: 0, batches: [], ...report };
+    if (reports.length === 0 && renders.length === 0) throw new ScriptRunError("The script made no edits. To see values or images without editing, call ctx.report or markups.renderSheet.");
+    return { kind: "edits", label: label || (renders.length > 0 ? "Rendered sheet/view images" : "Nothing changed: reports only"), steps: 0, batches: [], ...report, ...renderPart };
   }
   const words = label || `${steps.length} edit${steps.length === 1 ? "" : "s"} by script`;
-  return { kind: "edits", label: words, steps: steps.length, batches: chunkEdits(words, steps), ...report };
+  return { kind: "edits", label: words, steps: steps.length, batches: chunkEdits(words, steps), ...report, ...renderPart };
 }
 
 /** The report that stands in for those past the run's limit. */

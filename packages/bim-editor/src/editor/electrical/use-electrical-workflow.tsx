@@ -1,11 +1,11 @@
 'use client'
 
-import { useCallback, useMemo, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { ScheduleTab } from '../schedule-tab/ScheduleTab'
 import { dockTitle } from '../schedule-tab/dock'
 import { useDockedSchedule } from '../schedule-tab/use-docked-schedule'
 import { Lightbulb, Plug, X } from 'lucide-react'
-import { type ModelState, type Vec2, type ViewElement } from '@permitzip/bim-kernel'
+import { elementsOfKind, type BimElement, type ModelState, type Vec2, type ViewElement } from '@permitzip/bim-kernel'
 import { ADDON_UI, circuitTemplates, distributionEquipment, electricalConnections, polesForMembers, uncircuitedLoads, planCircuitDrop, planCircuitMove, planRemoveFromCircuits, type CircuitPlanResult } from '@permitzip/bim-pack-electrical'
 import type { NecEdition } from '@permitzip/bim-calc'
 import { Alert, AlertDescription, AlertTitle } from '../../ui/alert'
@@ -18,6 +18,7 @@ import { CheckPanel } from './CheckPanel'
 import { ElectricalTypesDialog, type ElectricalTypesTab } from './ElectricalTypesDialog'
 import { RebalanceDialog } from './RebalanceDialog'
 import { EditCircuitDialog } from './EditCircuitDialog'
+import { EditControlsDialog } from './EditControlsDialog'
 import { ELECTRICAL_PLACE_TYPES, type ElectricalPlaceKind, type ElectricalRibbon } from './electrical-tab'
 import { ElectricalProperties } from './ElectricalProperties'
 import { FeedPanelDialog } from './FeedPanelDialog'
@@ -34,6 +35,8 @@ import { useNecRulesFrom, type NecRules } from './use-nec-rules'
 import { useCapacityTargets } from './use-capacity-targets'
 import { useScheduleWorkflow } from './schedules/use-schedule-workflow'
 import type { NewScheduleFormSlot } from '../schedules/new-schedule-plan'
+import type { ScalarHeatmapOverlay, SceneLightEmitter, SceneLightingPreset } from '@permitzip/bim-viewer-3d'
+import { buildPhotometricsHeatmap, buildSceneLightEmitters, type PhotometricsHeatmapMode } from './photometrics-heatmap'
 
 export interface ElectricalWorkflowInput {
   /** The host project, for its Code Study's NEC edition. */
@@ -57,7 +60,7 @@ export interface ElectricalWorkflowInput {
   /** Open the one New schedule window on a pick (`form:<kind>`); the surface owns it. */
   readonly openNewSchedule?: (pick: string) => void
   /** Open (or make) a live diagram view; returns why it can't, or null. */
-  readonly openDiagram?: (kind: 'one_line' | 'electrical_riser') => string | null
+  readonly openDiagram?: (kind: 'one_line' | 'electrical_riser' | 'controls_diagram') => string | null
   /** Select these elements in the model (a finding's items). */
   readonly select: (ids: readonly string[]) => void
   /** The placed part under a screen point in the plan or 3D view, for dragging devices onto panels. */
@@ -66,6 +69,13 @@ export interface ElectricalWorkflowInput {
   readonly pickPlanPointAt?: (clientX: number, clientY: number) => Vec2 | null
   /** Show a proposal's devices as ghosts in the plan (null clears). */
   readonly previewParts?: (ghosts: readonly ProposalGhost[] | null) => void
+  /** Display or clear a trade-agnostic 3D false-color scalar heatmap overlay over floors/workplanes. */
+  readonly setScalarHeatmap?: (overlay: ScalarHeatmapOverlay | null) => void
+  /** Set physical 3D luminaire emitters rendered during evening/night/blackout presets. */
+  readonly setLightEmitters?: (emitters: readonly SceneLightEmitter[]) => void
+  /** Switch 3D time-of-day lighting preset (`morning`, `noon`, `afternoon`, `evening`, `night`, `night_blackout`, `no_shadows`). */
+  readonly setLightingPreset?: (preset: SceneLightingPreset) => void
+  readonly lightingPreset?: SceneLightingPreset
   /** Hear what the pointer is over (the Propose tool previews the room under it). */
   readonly subscribeHover?: (listener: (ids: readonly string[] | null) => void) => () => void
   /** Take plan clicks before selection (a click on a previewed room places its devices); returns the unregister. */
@@ -92,11 +102,15 @@ export interface ElectricalWorkflow {
   readonly necEdition: NecEdition | null
   /** The project's code rules (engine + edition), for dialogs mounted elsewhere that size circuits (Not placed yet › Circuit). */
   readonly nec: Pick<NecRules, 'engine' | 'necEdition'>
+  /** Open the docked interactive PanelView editor for a panel element id. */
+  readonly openPanelView: (panelId?: string) => void
 }
 
 type DialogState =
-  | { readonly kind: 'add'; readonly memberIds: readonly string[]; readonly linkId: string }
+  | { readonly kind: 'add'; readonly memberIds: readonly string[]; readonly linkId: string; readonly pickedPanelId?: string | null; readonly pickedCircuitId?: string | null }
+  | { readonly kind: 'add_pick'; readonly memberIds: readonly string[]; readonly linkId: string }
   | { readonly kind: 'edit'; readonly linkId: string }
+  | { readonly kind: 'controls' }
   | { readonly kind: 'feed'; readonly panelId: string; readonly linkId: string }
   | { readonly kind: 'rebalance'; readonly panelId: string | null }
   | { readonly kind: 'types'; readonly tab: ElectricalTypesTab }
@@ -121,6 +135,37 @@ const SELECT_LOADS = 'Select the receptacles, lights or equipment to circuit fir
 const PLACE_PANEL_FIRST = 'Place a panel first: Electrical › Panel, then name it in its properties.'
 
 /**
+ * Collect immutable element references that affect live 3D light emitters
+ * (levels, lighting fixtures & panels, their part types, photometric catalog
+ * entries, and emergency circuit links). Unrelated edits (notes, sheets,
+ * dimensions, walls, rooms) leave every reference identical (`===`), avoiding
+ * unnecessary emitter rebuilds and spotlight pool churn.
+ */
+function collectLightEmitterInputs(model: ModelState): Map<string, BimElement> {
+  const els = model.elements
+  const refs = new Map<string, BimElement>()
+  for (const level of elementsOfKind(els, 'level')) refs.set(level.id, level)
+  for (const part of elementsOfKind(els, 'part')) {
+    const pt = els[part.typeId]
+    if (pt?.kind !== 'part_type') continue
+    if (pt.definition.category !== 'lighting_fixture' && pt.definition.category !== 'electrical_equipment') continue
+    refs.set(part.id, part)
+    refs.set(pt.id, pt)
+  }
+  for (const cat of elementsOfKind(els, 'service_catalog')) refs.set(cat.id, cat)
+  for (const link of elementsOfKind(els, 'service_link')) refs.set(link.id, link)
+  return refs
+}
+
+function sameElementRefs(a: ReadonlyMap<string, BimElement> | null, b: ReadonlyMap<string, BimElement>): boolean {
+  if (!a || a.size !== b.size) return false
+  for (const [id, el] of b) {
+    if (a.get(id) !== el) return false
+  }
+  return true
+}
+
+/**
  * Everything the Electrical tab, the Circuit tab, the properties panel and
  * the panel view do, in one place, so the Building Model surface mounts it
  * once. Every edit goes through `submit` as the same commands the agent tools
@@ -139,8 +184,67 @@ export function useElectricalWorkflow(input: ElectricalWorkflowInput): Electrica
   const [scheduleAttempt, setScheduleAttempt] = useState(0)
   const [lastPanelId, setLastPanelId] = useState<string | null>(null)
   const [hintDismissed, setHintDismissed] = useState(false)
+  const [heatmapMode, setHeatmapMode] = useState<PhotometricsHeatmapMode>('off')
   const inputPreview = input.previewParts
+  const inputSetScalarHeatmap = input.setScalarHeatmap
+  const inputSetLightEmitters = input.setLightEmitters
+  const inputSetLightingPreset = input.setLightingPreset
+  const inputLightingPreset = input.lightingPreset ?? 'noon'
   const previewParts = useCallback((ghosts: readonly ProposalGhost[] | null) => inputPreview?.(ghosts), [inputPreview])
+  const emitterCacheRef = useRef<{
+    inputs: ReadonlyMap<string, BimElement> | null
+    emitters: readonly SceneLightEmitter[]
+    pushedTo: ((emitters: readonly SceneLightEmitter[]) => void) | undefined
+    dirty: boolean
+  }>({ inputs: null, emitters: [], pushedTo: undefined, dirty: true })
+  useEffect(() => {
+    const cache = emitterCacheRef.current
+    if (!inputSetLightEmitters) return
+    if (!model) {
+      if (cache.inputs !== null || cache.emitters.length > 0) {
+        cache.inputs = null
+        cache.emitters = []
+        cache.pushedTo = inputSetLightEmitters
+        cache.dirty = false
+        inputSetLightEmitters([])
+      }
+      return
+    }
+    const nextInputs = collectLightEmitterInputs(model)
+    const inputsUnchanged = sameElementRefs(cache.inputs, nextInputs)
+    if (!inputsUnchanged) {
+      cache.inputs = nextInputs
+      cache.dirty = true
+    }
+    // Defer emitter collection while lighting is disabled (`no_shadows`); rebuild as soon as a lit preset is active.
+    if (inputLightingPreset === 'no_shadows') return
+    if (!cache.dirty && cache.pushedTo === inputSetLightEmitters) return
+    if (cache.dirty) {
+      cache.emitters = buildSceneLightEmitters(model)
+      cache.dirty = false
+    }
+    cache.pushedTo = inputSetLightEmitters
+    inputSetLightEmitters(cache.emitters)
+  }, [inputSetLightEmitters, model, inputLightingPreset])
+  useEffect(() => {
+    const cache = emitterCacheRef.current
+    return () => {
+      cache.pushedTo = undefined
+      inputSetLightEmitters?.([])
+    }
+  }, [inputSetLightEmitters])
+  useEffect(() => {
+    if (!inputSetScalarHeatmap) return
+    if (!model || heatmapMode === 'off') {
+      inputSetScalarHeatmap(null)
+      return
+    }
+    const built = buildPhotometricsHeatmap(model, heatmapMode, input.levelId ?? null)
+    inputSetScalarHeatmap(built.overlay)
+    return () => {
+      inputSetScalarHeatmap(null)
+    }
+  }, [inputSetScalarHeatmap, model, heatmapMode, input.levelId])
   const closeDock = useCallback(() => setDock(null), [])
   const target = useMemo(() => electricalTarget(model, selectedIds), [model, selectedIds])
   const panels = useMemo(() => (model ? distributionEquipment(model.elements) : []), [model])
@@ -227,6 +331,10 @@ export function useElectricalWorkflow(input: ElectricalWorkflowInput): Electrica
     addBlocked,
     editCircuit: () => (singleCircuit ? setDialog({ kind: 'edit', linkId: singleCircuit.linkId }) : notify(editCircuitBlocked ?? '')),
     editBlocked: editCircuitBlocked,
+    editControls: {
+      run: () => setDialog({ kind: 'controls' }),
+      blocked: editBlocked ?? (model ? null : 'The model is still loading.'),
+    },
     removeFromCircuit: () => {
       if (!model) return
       const plan = planRemoveFromCircuits(model, target.loads)
@@ -245,7 +353,7 @@ export function useElectricalWorkflow(input: ElectricalWorkflowInput): Electrica
     ...(openDiagram
       ? {
           diagram: {
-            open: (kind: 'one_line' | 'electrical_riser') => {
+            open: (kind: 'one_line' | 'electrical_riser' | 'controls_diagram') => {
               const refusal = openDiagram(kind)
               if (refusal) notify(refusal, 'error')
             },
@@ -262,12 +370,49 @@ export function useElectricalWorkflow(input: ElectricalWorkflowInput): Electrica
     balance: { run: () => setDialog({ kind: 'rebalance', panelId: panelFor() }), blocked: editBlocked ?? (hasCircuits ? null : PLACE_PANEL_FIRST) },
     types: { run: () => setDialog({ kind: 'types', tab: 'connection' }), blocked: model ? null : 'The model is still loading.' },
     templates: { run: () => setDialog(templateCount > 0 ? { kind: 'template', name: null } : { kind: 'types', tab: 'template' }), blocked: editBlocked ?? (hasCircuits ? null : PLACE_PANEL_FIRST) },
+    photometrics3d: {
+      mode: heatmapMode,
+      setMode: (nextMode: PhotometricsHeatmapMode) => {
+        setHeatmapMode(nextMode)
+        if (!model) return
+        const built = buildPhotometricsHeatmap(model, nextMode, input.levelId ?? null)
+        notify(built.summary, nextMode === 'off' || built.pass ? 'info' : 'error')
+      },
+      lightingPreset: input.lightingPreset ?? 'noon',
+      setLightingPreset: (preset: SceneLightingPreset) => {
+        inputSetLightingPreset?.(preset)
+        const label =
+          preset === 'evening'
+            ? '3D Evening dusk — normal luminaires ON (emergency-only heads OFF).'
+            : preset === 'night'
+              ? '3D Night — normal luminaires at rated lumens (emergency-only heads OFF).'
+              : preset === 'night_blackout'
+                ? '3D Emergency Initial (0 min) — egress fixtures at emergency_lumens, exit-combo heads ON.'
+                : preset === 'night_blackout_90min'
+                  ? '3D Emergency 90-Min — battery fixtures at 60% end-of-discharge derate.'
+                  : `3D lighting set to ${preset.replace('_', ' ')}.`
+        notify(label, 'info')
+      },
+      blocked: model ? null : 'The model is still loading.',
+    },
     docked: { addon: ADDON_UI.addon, dock: DOCK, list: panels.map((p) => ({ id: p.id, name: p.name })), open: (id) => openPanelView(id) },
   }
 
   const properties =
     model && (target.loads.length > 0 || target.panels.length > 0) ? (
-      <ElectricalProperties model={model} target={target} addBlocked={addBlocked} onAdd={openAdd} onEdit={(linkId) => setDialog({ kind: 'edit', linkId })} onPanelView={openPanelView} onFeed={() => openFeed()} submit={submit} editBlocked={editBlocked} onManageTypes={() => setDialog({ kind: 'types', tab: 'connection' })} />
+      <ElectricalProperties
+        model={model}
+        target={target}
+        addBlocked={addBlocked}
+        onAdd={openAdd}
+        onEdit={(linkId) => setDialog({ kind: 'edit', linkId })}
+        onEditControls={() => setDialog({ kind: 'controls' })}
+        onPanelView={openPanelView}
+        onFeed={() => openFeed()}
+        submit={submit}
+        editBlocked={editBlocked}
+        onManageTypes={() => setDialog({ kind: 'types', tab: 'connection' })}
+      />
     ) : model && unreadyWhy ? (
       <Alert data-testid="electrical-not-ready">
         <Plug />
@@ -428,7 +573,8 @@ export function useElectricalWorkflow(input: ElectricalWorkflowInput): Electrica
         <AddToCircuitDialog
           model={model}
           memberIds={dialog.memberIds}
-          initialPanelId={singleCircuit?.sourceId ?? lastPanelId}
+          initialPanelId={dialog.pickedPanelId ?? singleCircuit?.sourceId ?? lastPanelId}
+          initialCircuitId={dialog.pickedCircuitId ?? null}
           newLinkId={dialog.linkId}
           submit={submit}
           onClose={() => setDialog(null)}
@@ -440,6 +586,16 @@ export function useElectricalWorkflow(input: ElectricalWorkflowInput): Electrica
             setDialog(null)
             ribbon.place('panel_208')
           }}
+          onPickOnPlan={() => setDialog({ kind: 'add_pick', memberIds: dialog.memberIds, linkId: dialog.linkId })}
+        />
+      )}
+      {dialog?.kind === 'add_pick' && (
+        <PlanCircuitPick
+          model={model}
+          pickPartAt={input.pickPartAt}
+          onPicked={(panelId, linkId) => setDialog({ kind: 'add', memberIds: dialog.memberIds, linkId: dialog.linkId, pickedPanelId: panelId, pickedCircuitId: linkId })}
+          onNotify={(msg) => notify(msg, 'info')}
+          onCancel={() => setDialog({ kind: 'add', memberIds: dialog.memberIds, linkId: dialog.linkId })}
         />
       )}
       {dialog?.kind === 'feed' && (
@@ -481,9 +637,65 @@ export function useElectricalWorkflow(input: ElectricalWorkflowInput): Electrica
         />
       )}
       {dialog?.kind === 'edit' && <EditCircuitDialog model={model} linkId={dialog.linkId} submit={submit} onClose={() => setDialog(null)} sizing={{ edition: nec.necEdition, engine: nec.engine }} />}
+      {dialog?.kind === 'controls' && <EditControlsDialog model={model} selectedIds={selectedIds} submit={submit} onSelect={select} onClose={() => setDialog(null)} />}
       {schedules.overlay}
     </>
   ) : null
 
-  return { ribbon, autoTab: target.loads.length > 0 || target.panels.length > 0 ? 'circuit' : null, properties, overlay: overlay ?? loadingSchedule, scheduleProperties: schedules.propertiesFor, newScheduleForms: schedules.formSlot, necEdition: nec.necEdition, nec }
+  return { ribbon, autoTab: target.loads.length > 0 || target.panels.length > 0 ? 'circuit' : null, properties, overlay: overlay ?? loadingSchedule, scheduleProperties: schedules.propertiesFor, newScheduleForms: schedules.formSlot, necEdition: nec.necEdition, nec, openPanelView }
+}
+
+/** One-click canvas picker for "Pick circuit on plan": clicks any circuited device and returns its panel & circuit id. */
+function PlanCircuitPick({
+  model,
+  pickPartAt,
+  onPicked,
+  onNotify,
+  onCancel,
+}: {
+  readonly model: ModelState
+  readonly pickPartAt: (clientX: number, clientY: number) => string | null
+  readonly onPicked: (panelId: string, linkId: string) => void
+  readonly onNotify: (msg: string) => void
+  readonly onCancel: () => void
+}) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onCancel()
+    }
+    const onClick = (e: MouseEvent) => {
+      if (e.button !== 0) return
+      const targetEl = e.target as HTMLElement | null
+      if (targetEl?.closest('[data-testid="circuit-pick-banner"]')) return
+      const hitId = pickPartAt(e.clientX, e.clientY)
+      if (!hitId) return
+      const conn = electricalConnections(model.elements, hitId).find((c) => c.circuit !== null)
+      const link = conn?.circuit ? model.elements[conn.circuit.linkId] : undefined
+      if (link?.kind !== 'service_link') {
+        onNotify('That device is not on a circuit yet — click a circuited fixture or receptacle, or press Esc.')
+        return
+      }
+      e.preventDefault()
+      e.stopPropagation()
+      onPicked(link.source.elementId, link.id)
+    }
+    window.addEventListener('keydown', onKey)
+    window.addEventListener('click', onClick, true)
+    return () => {
+      window.removeEventListener('keydown', onKey)
+      window.removeEventListener('click', onClick, true)
+    }
+  }, [model, pickPartAt, onPicked, onNotify, onCancel])
+
+  return (
+    <div
+      data-testid="circuit-pick-banner"
+      className="pointer-events-auto fixed top-16 left-1/2 z-50 flex -translate-x-1/2 items-center gap-2 rounded-md border bg-background/95 px-3 py-2 text-xs shadow-md backdrop-blur"
+    >
+      <span>Click any circuited device on the plan to join its circuit.</span>
+      <Button type="button" size="sm" variant="ghost" className="h-6 px-2 text-xs" onClick={onCancel}>
+        Cancel
+      </Button>
+    </div>
+  )
 }

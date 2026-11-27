@@ -2,7 +2,6 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import {
   ANCHORS,
-  AUTO_TAG_CATEGORIES,
   DIMENSION_KINDS,
   DIMENSION_UNITS,
   TAG_STYLE_BOXES,
@@ -243,16 +242,18 @@ const styleRef = z.string().min(1).max(200).describe("Tag style id or exact name
 /** Absent, a new tag takes the default style for its element's kind, if one is set. */
 const newTagStyle = styleRef.optional().describe("Tag style id or exact name (bim_list_tag_styles). Absent: the kind's default style, if any.");
 
+const MCP_AUTO_TAG_CATEGORIES = ["duct", "pipe", "air_terminal", "equipment", "fixture", "part"] as const;
+
 const autoTagInput = {
   view: viewRef,
-  categories: z.array(z.enum(AUTO_TAG_CATEGORIES)).min(1).max(AUTO_TAG_CATEGORIES.length).describe("What to tag: duct (sizes), pipe (sizes), air_terminal (mark + CFM), equipment, fixture, part."),
+  categories: z.array(z.enum(MCP_AUTO_TAG_CATEGORIES)).min(1).max(MCP_AUTO_TAG_CATEGORIES.length).describe("What to tag: duct (sizes), pipe (sizes), air_terminal (mark + CFM), equipment, fixture, part."),
   leaders: z.enum(["when_away", "always", "never"]).default("when_away"),
   include_tagged: z.boolean().default(false).describe("Also tag elements that already have a tag in this view."),
   text_height_in: z.number().min(0.06).max(0.25).optional(),
   style: newTagStyle,
 };
 
-type AutoTagArgs = { view: string; categories: Array<(typeof AUTO_TAG_CATEGORIES)[number]>; leaders?: "when_away" | "always" | "never"; include_tagged?: boolean; text_height_in?: number; style?: string };
+type AutoTagArgs = { view: string; categories: Array<(typeof MCP_AUTO_TAG_CATEGORIES)[number]>; leaders?: "when_away" | "always" | "never"; include_tagged?: boolean; text_height_in?: number; style?: string };
 
 
 /** A tag style's id from its id or name; null when there is none. */
@@ -565,8 +566,9 @@ export function registerBimAnnotationTools(server: McpServer, caller: ResolveBim
         at: pointInput.describe("The box's top-left: view feet, or paper inches on a sheet."),
         width_in: z.number().min(0.5).max(30).default(3),
         text_height_in: z.number().min(0.06).max(1).optional(),
+        mask: z.boolean().optional().describe("Opaque white paper mask behind the note so crossing linework stays clean."),
         leaders: z
-          .array(z.object({ to: pointInput, elbow: pointInput.optional(), arrow: z.enum(["arrow", "dot", "tick", "none"]).optional() }))
+          .array(z.object({ to: pointInput, elbow: pointInput.optional(), arrow: z.enum(["arrow", "filled_arrow", "dot", "filled_dot", "tick", "none"]).optional() }))
           .max(9)
           .optional(),
       },
@@ -585,6 +587,7 @@ export function registerBimAnnotationTools(server: McpServer, caller: ResolveBim
           width: (args.width_in ?? 3) * IN,
           textSize: args.text_height_in !== undefined ? args.text_height_in * IN : DEFAULT_NOTE_SIZE_MM,
           paragraphs: paragraphsForCommand(paragraphs),
+          ...(args.mask ? { mask: true } : {}),
           ...(args.leaders ? { leaders: args.leaders.map((l) => ({ to: owner.toStored(l.to), ...(l.elbow ? { elbow: owner.toStored(l.elbow) } : {}), ...(l.arrow ? { arrow: l.arrow } : {}) })) } : {}),
         };
       }),
@@ -618,7 +621,7 @@ export function registerBimAnnotationTools(server: McpServer, caller: ResolveBim
         elbow: z.union([z.literal("auto"), pointInput]).optional().describe('action tag: "auto" = elbow leader (also straightens a hand-placed bend); a point (view feet) places the bend.'),
         item_ids: z.array(z.string().min(1).max(200)).max(499).optional().describe("action spread: the other tags that move with item_id, clear of each other, with elbow leaders."),
         leaders: z
-          .array(z.object({ to: pointInput, elbow: pointInput.optional(), arrow: z.enum(["arrow", "dot", "tick", "none"]).optional() }))
+          .array(z.object({ to: pointInput, elbow: pointInput.optional(), arrow: z.enum(["arrow", "filled_arrow", "dot", "filled_dot", "tick", "none"]).optional() }))
           .max(9)
           .optional(),
       },

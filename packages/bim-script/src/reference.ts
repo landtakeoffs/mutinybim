@@ -135,6 +135,7 @@ export type ReferenceHit =
   | { readonly kind: "example"; readonly name: string; readonly title: string; readonly builds: string; readonly read: string };
 
 const STOP = new Set(["a", "an", "the", "i", "do", "how", "to", "make", "with", "of", "for", "in", "on", "and", "or", "is", "can", "what", "my", "me", "it", "be", "use", "using", "script", "scripts"]);
+const GENERIC_COMMAND_VERBS = new Set(["add", "create", "define", "delete", "edit", "get", "list", "put", "register", "remove", "save", "set", "update"]);
 
 function words(text: string): string[] {
   return text
@@ -143,6 +144,45 @@ function words(text: string): string[] {
     .split(/[\s._-]+/)
     .map((w) => (w.length > 3 && w.endsWith("s") ? w.slice(0, -1) : w))
     .filter((w) => w.length > 1 && !STOP.has(w));
+}
+
+/** Closest `ctx.edit` commands to a query or guessed command name (e.g. `"add_sheet_note"` → `create_text_note`). */
+export function searchCommands(query: string, limit = 6): readonly CommandEntry[] {
+  const normalized = query.replace(/_/g, " ");
+  const q = words(normalized);
+  const phrase = normalized.toLowerCase().trim();
+  if (q.length === 0) return [];
+  const nouns = q.filter((w) => !GENERIC_COMMAND_VERBS.has(w));
+  const headNoun = nouns[nouns.length - 1];
+  const hits: { entry: CommandEntry; score: number }[] = [];
+  for (const entry of scriptCommands()) {
+    const text = entry.type.replace(/_/g, " ");
+    const cmdWords = words(text);
+    const have = new Set(cmdWords);
+    let total = 0;
+    let nounMatches = 0;
+    for (const w of q) {
+      if (have.has(w)) {
+        if (GENERIC_COMMAND_VERBS.has(w)) {
+          total += 1;
+        } else {
+          total += 4;
+          nounMatches += 1;
+        }
+      } else if (!GENERIC_COMMAND_VERBS.has(w) && w.length >= 4 && cmdWords.some((cw) => cw.includes(w) || (cw.length >= 4 && w.includes(cw)))) {
+        total += 2;
+        nounMatches += 1;
+      }
+    }
+    if (nouns.length > 0 && nounMatches === 0) continue;
+    if (headNoun && have.has(headNoun)) total += 2;
+    if (phrase.length > 3 && text.includes(phrase)) total += 4;
+    if (total > 0) hits.push({ entry, score: total });
+  }
+  return hits
+    .sort((a, b) => b.score - a.score || a.entry.type.localeCompare(b.entry.type))
+    .slice(0, limit)
+    .map((h) => h.entry);
 }
 
 function score(query: readonly string[], phrase: string, fields: readonly { readonly text: string; readonly weight: number }[]): number {
@@ -187,6 +227,7 @@ export function searchReference(query: string, limit = 8): readonly ReferenceHit
 const KIT_PRELUDE = `/** A quantity with its kind; build one with units.* (stored in SI). */
 export interface Measure { readonly kind: string; readonly value: number }
 export interface PlanPoint { readonly x: Measure; readonly y: Measure }
+export interface SheetPoint { readonly x: Measure; readonly y: Measure }
 export type Dim = number | { param: string; scale?: number; add?: number } | { formula: string };
 export type Length = Measure | Dim;
 export type Face = "top" | "bottom" | "front" | "back" | "left" | "right";
@@ -223,7 +264,7 @@ export interface ScheduleFilter { readonly path: string; readonly op: "equals" |
 export interface ScheduleRow { readonly key: string; readonly element: string; readonly cells: Readonly<Record<string, number | string | boolean | null>> }
 export interface ScheduleRows { readonly name: string; readonly columns: readonly { readonly id: string; readonly heading: string; readonly valueType: string; readonly quantityKind?: string }[]; readonly rows: readonly ScheduleRow[]; readonly totals: Readonly<Record<string, number | null>>; readonly totalRows: number }
 export interface ScheduleClassFields { readonly id: string; readonly label: string; readonly fields: readonly { readonly path: string; readonly label: string; readonly valueType: string; readonly kind?: string; readonly unit?: string; readonly totals?: string }[]; readonly relationships: readonly { readonly id: string; readonly label: string; readonly to: string }[] }
-export type AutoTagCategory = "duct" | "pipe" | "air_terminal" | "equipment" | "fixture" | "part";
+export type AutoTagCategory = "duct" | "pipe" | "air_terminal" | "equipment" | "fixture" | "part" | "room" | "space" | "opening";
 /** A piece of equipment in a one-line you describe: kind ("utility", "switchboard", "panelboard", "transformer"…), name, ratings, what it feeds. */
 export interface OneLineNode { readonly id: string; readonly kind: string; readonly name: string; readonly ratings?: readonly string[]; readonly main?: { readonly device: string; readonly label?: string }; readonly feeder?: Readonly<Record<string, string | number | undefined>>; readonly children?: readonly OneLineNode[]; readonly placeholder?: boolean }
 /** A surface found over or under a point: its elevation (mm) and height above the floor. */
@@ -264,14 +305,316 @@ export interface RouteSpec {
 }
 export interface RouteHandle { readonly prefix: string; segment(n: number): string }
 export type TopSurface = "structure above" | "ceiling" | "roof";
-export type WallTop = { level: string; offset?: Measure } | TopSurface | { to: TopSurface; offset?: Measure };
+export type WallTop = { level: string; offset?: Measure } | TopSurface | { to: TopSurface; elementId?: string; offset?: Measure };
 export type WallBase = { offset: Measure } | "slab below" | { to: "slab below"; offset?: Measure };
-export interface ChainSpec { level: string; points: readonly PlanPoint[]; closed?: boolean; typeId?: string; thickness?: Measure; height?: Measure; top?: WallTop; base?: WallBase; topLevel?: string; topOffset?: Measure; values?: Record<string, string | number | boolean>; label?: string; id?: string }
-export interface WallSpec { level: string; from: PlanPoint; to: PlanPoint; typeId?: string; thickness?: Measure; height?: Measure; top?: WallTop; base?: WallBase; topLevel?: string; topOffset?: Measure; values?: Record<string, string | number | boolean>; label?: string; id?: string }
+export interface ChainSpec { level: string; points: readonly PlanPoint[]; closed?: boolean; typeId?: string; thickness?: Measure; height?: Measure; top?: WallTop; base?: WallBase; topLevel?: string; topOffset?: Measure; material?: string; values?: Record<string, string | number | boolean>; label?: string; id?: string }
+export interface WallSpec { level: string; from: PlanPoint; to: PlanPoint; typeId?: string; thickness?: Measure; height?: Measure; top?: WallTop; base?: WallBase; topLevel?: string; topOffset?: Measure; material?: string; values?: Record<string, string | number | boolean>; label?: string; id?: string }
+export interface AssemblyThermalSummary {
+  readonly totalThicknessMm: number;
+  readonly rSiM2KPerW: number;
+  readonly rImperial: number;
+  readonly uValueWPerM2K: number;
+  readonly uValueImperial: number;
+  readonly missingThermalMaterials: readonly string[];
+}
 export interface ChainHandle { readonly prefix: string; element(n: number): string }
-export interface OpeningSpec { wall: string; along: Measure; width?: Measure; height?: Measure; sill?: Measure; side?: 1 | -1; typeId?: string; mark?: string; values?: Record<string, string | number | boolean>; id?: string }
+export type DoorOperation = "SINGLE_SWING_LEFT" | "SINGLE_SWING_RIGHT" | "DOUBLE_DOOR_SINGLE_SWING" | "DOUBLE_SWING_LEFT" | "DOUBLE_SWING_RIGHT" | "DOUBLE_DOOR_DOUBLE_SWING" | "SLIDING_TO_LEFT" | "SLIDING_TO_RIGHT" | "DOUBLE_DOOR_SLIDING" | "FOLDING_TO_LEFT" | "FOLDING_TO_RIGHT" | "DOUBLE_DOOR_FOLDING" | "REVOLVING" | "ROLLINGUP" | "SWING_FIXED_LEFT" | "SWING_FIXED_RIGHT" | "USERDEFINED" | "NOTDEFINED" | "single_left" | "single_right" | "double" | "double_swing" | "double_acting_left" | "double_acting_right" | "double_acting_pair" | "sliding_left" | "sliding_right" | "sliding_double" | "folding_left" | "folding_right" | "folding_double" | "bifold_left" | "bifold_right" | "bifold_double" | "overhead" | "rolling" | "revolving" | "swing_fixed_left" | "swing_fixed_right";
+export type DoorSwing = "inward" | "outward" | "INWARD" | "OUTWARD";
+export type DoorHanding = "LH" | "RH" | "LHR" | "RHR";
+export type WindowPartitioning = "SINGLE_PANEL" | "DOUBLE_PANEL_VERTICAL" | "DOUBLE_PANEL_HORIZONTAL" | "TRIPLE_PANEL_VERTICAL" | "TRIPLE_PANEL_HORIZONTAL" | "TRIPLE_PANEL_BOTTOM" | "TRIPLE_PANEL_TOP" | "TRIPLE_PANEL_LEFT" | "TRIPLE_PANEL_RIGHT" | "USERDEFINED" | "NOTDEFINED" | "single" | "double_vertical" | "double_hung" | "double_horizontal" | "triple_vertical" | "triple_horizontal" | "triple_bottom" | "triple_top" | "triple_left" | "triple_right";
+export interface OpeningSpec { wall: string; along: Measure; width?: Measure; height?: Measure; sill?: Measure; side?: 1 | -1; typeId?: string; mark?: string; material?: string; frameDepth?: Measure; external?: boolean; values?: Record<string, string | number | boolean>; id?: string }
+export interface DoorSpec extends OpeningSpec { operation?: DoorOperation; hinge?: "left" | "right"; swing?: DoorSwing; handing?: DoorHanding; fireRating?: string }
+export interface WindowSpec extends OpeningSpec { partitioning?: WindowPartitioning }
 export interface PlacedPart { readonly id: string; connector(connectorId: string): RouteEnd }
-export interface PlanViewSpec { level: string; name: string; discipline?: string; scale?: number; cutHeight?: Measure; hide?: string[]; id?: string }
+export type SystemLinePattern = "solid" | "dashed" | "dotted" | "dash_dot" | "dash_dot_dot" | "dash_dot_dot_dot" | "long_dash";
+export type SystemLineWeight = "thin" | "medium" | "wide" | "heavy";
+export interface CategoryOverrideSpec {
+  visible?: boolean; halftone?: boolean;
+  lineWeights?: { cut?: SystemLineWeight; projection?: SystemLineWeight };
+  pattern?: SystemLinePattern; colour?: string; planSymbol?: boolean; maskBeneath?: boolean; transparency?: number;
+  detailLevel?: "coarse" | "medium" | "fine";
+  singleLineBelow?: Measure;
+}
+export interface CropBoxSpec {
+  from?: PlanPoint; to?: PlanPoint;
+  cropView?: boolean; showCropBox?: boolean;
+  annotationCrop?: boolean; annotationCropOffsetMm?: number;
+  depth?: Measure;
+  levelLeftExtMm?: number; levelRightExtMm?: number;
+  headExt?: Measure; tailExt?: Measure; splitGap?: boolean;
+}
+export interface PlanViewSpec {
+  level: string; name: string; discipline?: string; scale?: number; cutHeight?: Measure;
+  viewTop?: Measure; viewTopRef?: "associated_level" | "level_above" | "unlimited"; viewBottom?: Measure; viewDepth?: Measure;
+  browserGroup?: string; sortOrder?: number; viewTemplate?: string;
+  detailLevel?: "coarse" | "medium" | "fine";
+  visualStyle?: "wireframe" | "hidden_line" | "shaded" | "shaded_edges";
+  showLineCodes?: boolean;
+  offsetStackedRuns?: boolean;
+  showReferenceDisciplines?: readonly string[];
+  symbolScale?: number;
+  hide?: string[];
+  hideElements?: readonly string[];
+  showClearanceLabels?: boolean;
+  hideDeviceMarks?: boolean;
+  categoryOverrides?: Readonly<Record<string, CategoryOverrideSpec>>;
+  crop?: { from: PlanPoint; to: PlanPoint };
+  cropPolygon?: readonly PlanPoint[];
+  id?: string;
+}
+export interface ViewChanges {
+  viewTemplate?: string | null;
+  discipline?: string | null; scale?: number; cutHeight?: Measure;
+  viewTop?: Measure | null; viewTopRef?: "associated_level" | "level_above" | "unlimited" | null;
+  browserGroup?: string | null; sortOrder?: number | null;
+  viewBottom?: Measure | null; viewDepth?: Measure;
+  detailLevel?: "coarse" | "medium" | "fine";
+  visualStyle?: "wireframe" | "hidden_line" | "shaded" | "shaded_edges";
+  showLineCodes?: boolean;
+  offsetStackedRuns?: boolean;
+  showReferenceDisciplines?: readonly string[];
+  symbolScale?: number;
+  hide?: string[];
+  hideElements?: readonly string[];
+  showClearanceLabels?: boolean;
+  hideDeviceMarks?: boolean;
+  /** Replaces the view's category override map; pass {} to clear all overrides. */
+  categoryOverrides?: Readonly<Record<string, CategoryOverrideSpec>>;
+  cropPolygon?: readonly PlanPoint[] | null;
+}
+export type ViewTemplateLockKey = "view_range" | "category_overrides" | "detail_level" | "visual_style" | "discipline" | "annotations" | "pack_props";
+export interface ViewTemplateSpec {
+  id?: string; name: string; description?: string;
+  viewTypes?: readonly ("floor_plan" | "ceiling_plan" | "section" | "elevation" | "three_d" | "detail" | "schedule")[];
+  locks: readonly ViewTemplateLockKey[];
+  discipline?: string; browserGroup?: string; scale?: number; cutHeight?: Measure;
+  viewTop?: Measure; viewTopRef?: "associated_level" | "level_above" | "unlimited";
+  viewBottom?: Measure; viewDepth?: Measure;
+  detailLevel?: "coarse" | "medium" | "fine";
+  visualStyle?: "wireframe" | "hidden_line" | "shaded" | "shaded_edges";
+  showLineCodes?: boolean; offsetStackedRuns?: boolean;
+  showReferenceDisciplines?: readonly string[]; symbolScale?: number;
+  hide?: string[]; showClearanceLabels?: boolean; hideDeviceMarks?: boolean;
+  categoryOverrides?: Readonly<Record<string, CategoryOverrideSpec>>;
+  packProps?: Readonly<Record<string, unknown>>;
+  sourceLibraryId?: string;
+}
+export interface VerticalViewSpec {
+  name: string; from: PlanPoint; to: PlanPoint; direction?: 1 | -1; depth?: Measure;
+  crop?: { from: PlanPoint; to: PlanPoint };
+  headExt?: Measure; tailExt?: Measure; splitGap?: boolean;
+  levelLeftExtMm?: number; levelRightExtMm?: number;
+  showInDisciplines?: readonly string[];
+  level?: string; discipline?: string; scale?: number; hide?: string[]; id?: string;
+}
+export interface EnlargedPlanSpec { parent: string; name: string; from?: PlanPoint; to?: PlanPoint; polygon?: readonly PlanPoint[]; showLabel?: boolean; scale?: number; label?: string; head?: PlanPoint; discipline?: string; cutHeight?: Measure; id?: string; calloutId?: string }
+export interface CalloutRefSpec { view: string; target: string; from?: PlanPoint; to?: PlanPoint; polygon?: readonly PlanPoint[]; showLabel?: boolean; head?: PlanPoint; label?: string; id?: string }
+export interface Point3Spec { readonly x: Measure; readonly y: Measure; readonly z: Measure }
+export type LookFrom3d = "south_west" | "south_east" | "north_west" | "north_east" | "south" | "north" | "east" | "west" | "top";
+export interface Camera3dSpec {
+  lookFrom?: LookFrom3d; eye?: Point3Spec; target?: Point3Spec; up?: { x: number; y: number; z: number };
+  fovDeg?: number; orthoHeight?: Measure; projection?: "perspective" | "orthographic";
+}
+export interface View3dSpec extends Camera3dSpec {
+  name: string; fitElements?: readonly string[]; fitRegion?: { min: Point3Spec; max: Point3Spec };
+  cropBox?: { center: Point3Spec; halfSize: Point3Spec; rotationDeg?: number };
+  cropView?: boolean; showCropBox?: boolean; id?: string;
+}
+export type LuminaireEmergencyMode = "none" | "battery_pack" | "generator_circuit" | "inverter";
+export type PhotometricOverlayMode = "off" | "normal" | "egress";
+export type PhotometricsCalculationMode = "simplified" | "detailed" | "surfaces";
+export type RadiosityMethod = "patch_radiosity" | "cavity";
+export type DaylightSkyModel = "cie_overcast" | "cie_clear" | "cie_intermediate";
+export interface DaylightSpec {
+  enabled?: boolean; skyModel?: DaylightSkyModel; outdoorHorizontalFc?: number;
+  sunAzimuthDeg?: number; sunElevationDeg?: number; directSunNormalFc?: number; includeElectric?: boolean;
+}
+export interface LuminaireIesSpec {
+  profile?: string; iesText?: string; saveAsProfile?: string;
+  emergencyMode?: LuminaireEmergencyMode; emergencyLumens?: number; emergencyBallastFactor?: number;
+  egressFixture?: boolean; lld?: number; ldd?: number; llf?: number; tiltDeg?: number;
+}
+export interface PhotometricsRunSpec {
+  level?: string; spaceIds?: readonly string[]; gridSpacing?: Measure | number; workplaneHeight?: Measure | number;
+  calculationMode?: PhotometricsCalculationMode; useMaterialReflectances?: boolean;
+  includeFurnitureOcclusion?: boolean; includeTaskSurfaces?: boolean;
+  interReflectance?: boolean; radiosityMethod?: RadiosityMethod; daylight?: DaylightSpec;
+  reflectances?: { ceiling?: number; wall?: number; floor?: number };
+}
+export interface DaylightAnalysisSpec extends Omit<PhotometricsRunSpec, "daylight"> {
+  skyModel?: DaylightSkyModel; outdoorHorizontalFc?: number; sunAzimuthDeg?: number;
+  sunElevationDeg?: number; directSunNormalFc?: number; includeElectric?: boolean;
+}
+export interface RadianceExportSpec {
+  skyModel?: DaylightSkyModel; sunAzimuthDeg?: number; sunElevationDeg?: number;
+  includeLuminaires?: boolean; gridSpacing?: Measure | number; workplaneHeight?: Measure | number;
+}
+export interface EgressLightingCheckSpec {
+  level?: string; gridSpacing?: Measure | number; workplaneHeight?: Measure | number;
+  calculationMode?: PhotometricsCalculationMode; includeFurnitureOcclusion?: boolean;
+  interReflectance?: boolean; battery90MinDerate?: number;
+  egressPaths?: readonly { id: string; name: string; levelId?: string; levelName?: string; outline?: readonly { x: Measure | number; y: Measure | number }[]; polyline?: readonly { x: Measure | number; y: Measure | number }[]; widthFt?: number }[];
+  explicitOnly?: boolean;
+}
+export interface PhotometricOverlaySpec {
+  mode: PhotometricOverlayMode; showContours?: boolean; showGridValues?: boolean; showFailingHighlights?: boolean;
+  gridSpacing?: Measure | number; workplaneHeight?: Measure | number; contourLevels?: readonly number[];
+}
+export type SymbolPrimitive = NonNullable<PartTypeDefinition["planSymbols"]>[number];
+export type CeilingGridSpec =
+  | { readonly preset: "2x4" | "2x2"; readonly origin?: PlanPoint; readonly rotationDeg?: number }
+  | { readonly preset?: undefined; readonly spacingX: Measure; readonly spacingY: Measure; readonly origin?: PlanPoint; readonly rotationDeg?: number };
+export interface WallMountSpec { readonly wall: string; readonly along?: Measure; readonly side?: 1 | -1; readonly toward?: PlanPoint; readonly offset?: Measure }
+export interface CalloutBoundarySpec { readonly from?: PlanPoint; readonly to?: PlanPoint; readonly polygon?: readonly PlanPoint[]; readonly head?: PlanPoint; readonly showLabel?: boolean; readonly syncViewCrop?: boolean }
+export type TextStyleRole = "part_mark" | "link_label" | "tag" | "dimension" | "note" | "space_label";
+export interface CircuitGraphicsSettingsSpec {
+  readonly style?: "arcs" | "orthogonal" | "numbers" | "off";
+  readonly showCircuits?: boolean; readonly homeRuns?: boolean; readonly switchLegs?: boolean;
+  readonly switchLegLabels?: boolean; readonly allCopies?: boolean;
+  readonly hashMarks?: "off" | "hots_neutral" | "hots_neutral_ground";
+  readonly hashMarksOn?: "home_runs" | "home_runs_and_switch_legs" | "all_runs";
+  readonly typLabelsOnce?: boolean;
+}
+export interface HomeRunSpec {
+  readonly member?: string;
+  readonly tipOffset?: { readonly x: Measure; readonly y: Measure };
+  readonly bendOffset?: { readonly x: Measure; readonly y: Measure };
+  readonly labelOffset?: { readonly x: Measure; readonly y: Measure };
+}
+export type DiagramHints = NonNullable<NonNullable<NonNullable<Extract<EditCommand, { type: "create_view" }>["props"]>["diagram"]>["hints"]>;
+export type ClashType = "hard" | "self" | "soft" | "clearance" | "dedicated_space" | "ceiling" | "placement" | "connectors";
+export interface ClashCheckSpec {
+  readonly ruleset?: "default" | "coordination" | "documents" | "issue";
+  readonly types?: readonly ClashType[];
+  readonly minSeverity?: "error" | "warning" | "info";
+  readonly scope?: "touched" | "level" | "all";
+  readonly level?: string;
+  readonly ids?: readonly string[];
+  readonly tolerance?: Measure;
+  readonly softClearance?: Measure;
+  readonly structureClearance?: Measure;
+  readonly maxFindings?: number;
+  readonly skipRules?: readonly string[];
+}
+export interface ClashReport {
+  readonly scope: "touched" | "level" | "all";
+  readonly detail: "summary" | "compact" | "full";
+  readonly total: number;
+  readonly shown: number;
+  readonly by_severity: { readonly error: number; readonly warning: number; readonly info: number };
+  readonly by_rule: Readonly<Record<string, number>>;
+  readonly findings?: readonly unknown[];
+}
+export type DetailLineStyleId = "thin" | "medium" | "wide" | "heavy" | "hidden" | "overhead" | "dashed" | "match" | "center" | "phantom" | "dotted";
+export type LineWeight2D = "thin" | "medium" | "wide" | "heavy";
+export type LinePattern2D = "solid" | "dashed" | "hidden" | "center" | "phantom" | "dotted";
+export type DraftingCategory = "detail_lines" | "detail_regions" | "detail_components" | "insulation" | "centerlines" | "hidden_lines" | "reference";
+export type HatchPattern = "solid" | "diagonal" | "diagonal_reverse" | "crosshatch" | "horizontal" | "vertical" | "dots" | "concrete" | "earth" | "insulation_rigid" | "masonry" | "steel_section" | "gravel" | "sand" | "gypsum" | "wood_grain" | "metal_deck" | "roofing_membrane" | "acoustic";
+export type RegionTone = "ink" | "halftone" | "screened";
+export type NoteLeaderArrow = "arrow" | "filled_arrow" | "dot" | "filled_dot" | "tick" | "none";
+export type NoteAlign = "left" | "center" | "right";
+export interface DraftStyleSpec { lineStyle?: DetailLineStyleId; weight?: LineWeight2D; pattern?: LinePattern2D; category?: DraftingCategory; group?: string }
+export type DraftRectGeometry = { corner: PlanPoint; opposite: PlanPoint } | { at: PlanPoint; width: Measure; height: Measure };
+export interface DetailViewSpec { name: string; scale?: number; discipline?: string; crop?: { from: PlanPoint; to: PlanPoint }; id?: string }
+export interface DraftLeaderSpec { to: PlanPoint; elbow?: "auto" | PlanPoint | null; arrow?: NoteLeaderArrow }
+export interface DraftNoteSpec {
+  view: string; at: PlanPoint; text?: string;
+  paragraphs?: readonly { align?: NoteAlign; list?: "bullet" | "number"; runs: readonly { text: string; bold?: boolean; italic?: boolean; underline?: boolean; size?: number }[] }[];
+  width?: Measure; textHeight?: Measure; align?: NoteAlign; bold?: boolean; italic?: boolean; underline?: boolean;
+  mask?: boolean; textStyleId?: string; leaders?: readonly DraftLeaderSpec[]; id?: string;
+}
+export interface CalloutStackEntry { text: string; to?: PlanPoint | readonly PlanPoint[]; arrow?: NoteLeaderArrow; bold?: boolean; id?: string }
+export interface DraftCalloutStackSpec {
+  view: string; side: "left" | "right"; x: Measure; topY: Measure;
+  width?: Measure; textHeight?: Measure; gap?: Measure; mask?: boolean; arrow?: NoteLeaderArrow;
+  notes: readonly CalloutStackEntry[];
+}
+export type DraftModifyOp =
+  | { op: "move"; dx: Measure; dy: Measure; disjoin?: boolean }
+  | { op: "copy"; dx: Measure; dy: Measure }
+  | { op: "rotate"; center: PlanPoint; angleDeg: number; copy?: boolean }
+  | { op: "scale"; center: PlanPoint; factor: number }
+  | { op: "mirror"; axisFrom: PlanPoint; axisTo: PlanPoint; copy?: boolean }
+  | { op: "linear_array"; dx: Measure; dy: Measure; count: number; group?: boolean }
+  | { op: "radial_array"; center: PlanPoint; angleDeg: number; count: number; group?: boolean }
+  | { op: "align"; from: PlanPoint; axisFrom: PlanPoint; axisTo: PlanPoint }
+  | { op: "offset"; distance: Measure; side: PlanPoint; copy?: boolean }
+  | { op: "trim_corner"; keepA: PlanPoint; keepB: PlanPoint }
+  | { op: "trim_single"; boundaryId: string; pick: PlanPoint }
+  | { op: "trim_multiple"; boundaryId: string; picks: readonly PlanPoint[] }
+  | { op: "trim"; boundaryId: string; keep: PlanPoint }
+  | { op: "extend"; boundaryId: string; near: PlanPoint }
+  | { op: "split"; at: PlanPoint; to?: PlanPoint }
+  | { op: "split_gap"; at: PlanPoint; gap: Measure }
+  | { op: "fillet"; radius: Measure; near1?: PlanPoint; near2?: PlanPoint }
+  | { op: "chamfer"; distanceA: Measure; distanceB?: Measure; near1?: PlanPoint; near2?: PlanPoint }
+  | { op: "drag_end"; end: 0 | 1 | "start" | "end"; to: PlanPoint; disjoin?: boolean }
+  | { op: "pin" | "unpin" | "delete" }
+  | { op: "match_type"; sourceId: string };
+export interface DetailAudit {
+  readonly ok: boolean; readonly clean: boolean; readonly viewId: string; readonly scale: number;
+  readonly itemCount: number; readonly noteCount: number; readonly dimensionCount: number; readonly dimCount: number;
+  readonly boundsMm: { readonly min: { readonly x: number; readonly y: number }; readonly max: { readonly x: number; readonly y: number } } | null;
+  readonly textOverlaps: readonly { readonly aId: string; readonly aText: string; readonly bId: string; readonly bText: string; readonly overlapAreaMm2: number }[];
+  readonly lineCrossings: readonly { readonly itemId: string; readonly text: string; readonly crossingCount: number }[];
+  readonly clippedItems: readonly string[];
+  readonly orphanedDimensions: readonly string[];
+  readonly issues: readonly string[];
+}
+export type MarkupTool = "marker" | "highlighter";
+export type MarkupStatus = "open" | "addressed" | "resolved";
+export type MarkupSmartShape = "line" | "rect" | "circle";
+export type PaperPointInput = { readonly x: number; readonly y: number } | { readonly x: Measure; readonly y: Measure };
+export interface ScriptRenderRequest {
+  readonly kind: "sheet" | "view";
+  readonly targetId: string;
+  readonly label: string;
+  readonly regionMm?: { readonly min: { readonly x: number; readonly y: number }; readonly max: { readonly x: number; readonly y: number } };
+  readonly includeMarkups?: boolean;
+  readonly includeResolvedMarkups?: boolean;
+  readonly monochromeSheet?: boolean;
+  readonly highlightIds?: readonly string[];
+  readonly dpi?: number;
+  readonly maxPx?: number;
+}
+export interface SheetMarkupSummary {
+  readonly id: string; readonly sheetId: string; readonly sheetNumber: string; readonly sheetTitle: string;
+  readonly tool: MarkupTool; readonly color: string; readonly widthMm: number; readonly status: MarkupStatus;
+  readonly smartShape?: MarkupSmartShape; readonly author?: string; readonly createdAt?: string; readonly addressedNote?: string; readonly addressedColor?: string; readonly note?: string;
+  readonly pointCount: number;
+  readonly boundsMm: { readonly min: { readonly x: number; readonly y: number }; readonly max: { readonly x: number; readonly y: number } } | null;
+  readonly boundsIn: { readonly min: { readonly x: number; readonly y: number }; readonly max: { readonly x: number; readonly y: number } } | null;
+  readonly viewports: readonly {
+    readonly viewportId: string; readonly viewId: string; readonly viewName: string; readonly viewType: string; readonly scale: number; readonly level?: string;
+    readonly modelBoundsFt: { readonly min: { readonly xFt: number; readonly yFt: number }; readonly max: { readonly xFt: number; readonly yFt: number } };
+    readonly modelPointsFt: readonly { readonly xFt: number; readonly yFt: number }[];
+  }[];
+}
+export interface MarkedSheetSummary {
+  readonly sheetId: string; readonly number: string; readonly title: string; readonly paperSize: string;
+  readonly openCount: number; readonly addressedCount: number; readonly resolvedCount: number; readonly totalCount: number;
+  readonly markupIds: readonly string[];
+  readonly boundsMm: { readonly min: { readonly x: number; readonly y: number }; readonly max: { readonly x: number; readonly y: number } } | null;
+  readonly viewports: readonly { readonly viewportId: string; readonly viewId: string; readonly viewName: string; readonly scale: number }[];
+}
+export interface RenderSheetMarkupOptions {
+  readonly label?: string; readonly focusMarkupIds?: readonly string[]; readonly focusStatus?: MarkupStatus | "all";
+  readonly padMm?: number;
+  readonly regionMm?: { readonly min: { readonly x: number; readonly y: number }; readonly max: { readonly x: number; readonly y: number } };
+  readonly regionIn?: { readonly min: { readonly x: number; readonly y: number }; readonly max: { readonly x: number; readonly y: number } };
+  readonly includeMarkups?: boolean; readonly includeResolvedMarkups?: boolean; readonly monochromeSheet?: boolean;
+  readonly highlightIds?: readonly string[]; readonly dpi?: number; readonly maxPx?: number;
+}
+export interface RenderAllMarkedSheetsOptions {
+  readonly status?: MarkupStatus | "all"; readonly mode?: "full" | "crop" | "both"; readonly maxImages?: number;
+  readonly padMm?: number; readonly monochromeSheet?: boolean; readonly dpi?: number; readonly maxPx?: number;
+}
+export interface AddSheetMarkupSpec {
+  readonly id?: string; readonly points: readonly PaperPointInput[];
+  readonly tool?: MarkupTool; readonly color?: string; readonly widthMm?: number;
+  readonly closed?: boolean; readonly smartShape?: MarkupSmartShape;
+  readonly status?: MarkupStatus; readonly author?: string; readonly note?: string;
+}
 `;
 
 function member(e: KitEntry): string {

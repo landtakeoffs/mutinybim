@@ -5,9 +5,12 @@ import { units } from "./define";
 import { building, equipment } from "./kit-building";
 import { checks } from "./kit-checks";
 import { documents } from "./kit-documents";
+import { markups } from "./kit-markups";
+import { drafting } from "./kit-drafting";
+import { electrical } from "./kit-electrical";
 import { parts } from "./kit-parts";
 import { routes } from "./kit-routes";
-import { scriptCommands } from "./reference";
+import { scriptCommands, searchCommands } from "./reference";
 
 /**
  * The kit's lint, before anything runs: the library's source rules
@@ -77,7 +80,7 @@ export interface ScriptKitWarning {
   readonly message: string;
 }
 
-const KIT_NAMESPACES: Readonly<Record<string, object>> = { units, routes, parts, building, equipment, documents, checks };
+const KIT_NAMESPACES: Readonly<Record<string, object>> = { units, routes, parts, building, equipment, documents, markups, drafting, checks, electrical };
 const KIT_IMPORT = /\bimport\s*\{([^}]*)\}\s*from\s*["']@permitzip\/bim-script["'];?/;
 
 /** Up to four real names close to a wrong one: those that contain it or are contained in it first, then those that start the same. */
@@ -116,7 +119,7 @@ export function kitUseWarnings(source: string): ScriptKitWarning[] {
   const commented = (line: number) => /^\s*(\/\/|\*|\/\*)/.test(lines[line - 1] ?? "");
   const seen = new Set<string>();
 
-  for (const m of source.matchAll(/(?<![.\w$])(units|routes|parts|building|equipment|documents|checks)\.([A-Za-z_$][\w$]*)/g)) {
+  for (const m of source.matchAll(/(?<![.\w$"'`])(units|routes|parts|building|equipment|documents|markups|drafting|checks|electrical)\.([A-Za-z_$][\w$]*)/g)) {
     const ns = m[1] ?? "";
     const member = m[2] ?? "";
     const kit = KIT_NAMESPACES[ns];
@@ -134,7 +137,7 @@ export function kitUseWarnings(source: string): ScriptKitWarning[] {
     commands ??= scriptCommands().map((c) => c.type);
     if (commands.includes(type) || seen.has(`edit.${type}`) || commented(line)) continue;
     seen.add(`edit.${type}`);
-    const near = nearNames(type, commands);
+    const near = [...new Set([...searchCommands(type, 4).map((c) => c.type), ...nearNames(type, commands)])].slice(0, 4);
     out.push({ line, rule: "kit", message: `Line ${line} sends ctx.edit a "${type}" command, and there is no such command.${near.length > 0 ? ` Near: ${near.join(", ")}.` : ""} bim_script_reference({ command: "<name>" }) gives one command's fields; ({ search }) finds one.` });
   }
   return out.sort((a, b) => a.line - b.line);

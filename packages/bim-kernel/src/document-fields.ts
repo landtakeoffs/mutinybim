@@ -14,17 +14,24 @@ export const DOCUMENT_FIELDS = {
   size: "doc.size",
   scale: "doc.scale",
   northArrow: "doc.northArrow",
+  northArrowOffsetMm: "doc.northArrowOffsetMm",
+  titleOffsetMm: "doc.titleOffsetMm",
+  titleRuleMm: "doc.titleRuleMm",
   points: "doc.points",
   text: "doc.text",
   dim: "doc.dim",
   tag: "doc.tag",
   callout: "doc.callout",
   figure: "doc.figure",
+  markup: "doc.markup",
   detail: "doc.detail",
   deleted: "doc.deleted",
   titleBlock: "doc.titleBlock",
   titleBlockRow: "doc.titleBlockRow",
   revisions: "doc.revisions",
+  sheetDiscipline: "doc.sheetDiscipline",
+  sheetGroup: "doc.sheetGroup",
+  sheetSortOrder: "doc.sheetSortOrder",
   prop: (key: string) => `doc.props.${key}`,
   field: (key: string) => `doc.fields.${key}`,
 } as const;
@@ -44,12 +51,20 @@ export function documentFieldValue(el: BimElement, field: string): AuthoredValue
       if (key === "crop") return canonicalJson({ min: el.cropMin, max: el.cropMax });
       if (key.startsWith("props.")) return canonicalJson(propValue(el.props, key.slice(6)));
       return undefined;
+    case "view_template":
+      if (key === "name") return el.name;
+      if (key === "locks") return canonicalJson(el.locks);
+      if (key.startsWith("props.")) return canonicalJson(propValue(el.props, key.slice(6)));
+      return undefined;
     case "sheet":
       if (key === "number") return el.number;
       if (key === "title") return el.title;
       if (key === "titleBlock") return el.props?.titleBlock ?? "";
       if (key === "titleBlockRow") return el.props?.titleBlockRow ? `${el.props.titleBlockRow.id}@${el.props.titleBlockRow.revision}` : "";
       if (key === "revisions") return canonicalJson(el.props?.revisions ?? []);
+      if (key === "sheetDiscipline") return el.props?.discipline ?? "";
+      if (key === "sheetGroup") return el.props?.group ?? "";
+      if (key === "sheetSortOrder") return el.props?.sortOrder !== undefined ? String(el.props.sortOrder) : "";
       if (key.startsWith("fields.")) return el.props?.fields?.[key.slice(7)] ?? "";
       return undefined;
     case "viewport":
@@ -57,6 +72,9 @@ export function documentFieldValue(el: BimElement, field: string): AuthoredValue
       if (key === "size") return el.size;
       if (key === "scale") return el.scale;
       if (key === "northArrow") return el.northArrow === undefined ? "default" : String(el.northArrow);
+      if (key === "northArrowOffsetMm") return canonicalJson(el.northArrowOffsetMm ?? null);
+      if (key === "titleOffsetMm") return canonicalJson(el.titleOffsetMm ?? null);
+      if (key === "titleRuleMm") return canonicalJson(el.titleRuleMm ?? null);
       return undefined;
     case "drawing_item":
       if (key === "points") return canonicalJson(el.points);
@@ -66,6 +84,7 @@ export function documentFieldValue(el: BimElement, field: string): AuthoredValue
       if (key === "callout") return canonicalJson(el.callout ?? null);
       if (key === "figure") return canonicalJson(el.figure ?? null);
       if (key === "block") return canonicalJson(el.block ?? null);
+      if (key === "markup") return canonicalJson(el.markup ?? null);
       if (key === "detail") return canonicalJson({ lineStyle: el.lineStyle ?? null, closed: el.closed ?? null, ccw: el.ccw ?? null, fill: el.fill ?? null, component: el.component ?? null, batt: el.batt ?? null, category: el.category ?? null, detailGroup: el.detailGroup ?? null, ...(el.pinned ? { pinned: true } : {}) });
       return noteFieldValue(el, field);
     default:

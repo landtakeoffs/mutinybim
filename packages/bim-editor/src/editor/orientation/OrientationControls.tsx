@@ -1,7 +1,7 @@
 'use client'
 
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { ChevronDown, Home, LayoutTemplate, Scan } from 'lucide-react'
+import { ChevronDown, Footprints, Home, LayoutTemplate, Scan } from 'lucide-react'
 import type { ModelViewer3D } from '@permitzip/bim-viewer-3d'
 import {
   isElevationSide,
@@ -15,6 +15,8 @@ import {
   type ViewVector,
 } from '@permitzip/bim-viewer-3d/light'
 import { Button } from '../../ui/button'
+import { cn } from '../../ui/cn'
+import { Slider } from '../../ui/slider'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -41,9 +43,11 @@ export const THREE_QUARTER_VIEWS: ReadonlyArray<{ readonly label: string; readon
 ]
 
 const RAD_TO_DEG = 180 / Math.PI
+/** Keys that adjust a slider thumb; stop them from bubbling to the menu's roving focus or the window's geometry nudge, while leaving Escape and Tab alone. */
+const SLIDER_ADJUST_KEYS = new Set(['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown'])
 
 interface Props {
-  readonly viewer: Pick<ModelViewer3D, 'orientation' | 'onCameraChange' | 'orientTo' | 'orbitBy' | 'frame'>
+  readonly viewer: Pick<ModelViewer3D, 'orientation' | 'onCameraChange' | 'orientTo' | 'orbitBy' | 'frame' | 'camera3dState' | 'setFovDeg' | 'walking' | 'setWalk' | 'onWalkChange' | 'walkSpeed' | 'setWalkSpeed' | 'onWalkSpeedChange'>
   /** Space to leave on the right (the properties panel), px. */
   readonly rightInset: number
   readonly canCreateViews: boolean
@@ -61,14 +65,24 @@ export const otherProjection = (p: Projection): Projection => (p === 'orthograph
 
 /**
  * Orientation controls for the 3D view, top right: the orientation ball, then a
- * flat toolbar with Home, the projection switch, a compass dial whose N is
- * true north, and a menu that lists every preset view. When the camera sits
- * square on the top or a side, it offers to save that as a plan or elevation.
+ * flat toolbar with Home, the Walk switch, the projection switch, a compass
+ * dial whose N is true north, and a menu that lists every preset view. When the
+ * camera sits square on the top or a side, it offers to save that as a plan or
+ * elevation.
  */
 export function OrientationControls({ viewer, rightInset, canCreateViews, blockedReason, onCreatePlan, onCreateElevation, trueNorthDeg, projection, onProjectionChange }: Props) {
   const dialRef = useRef<HTMLSpanElement | null>(null)
   const [squareOn, setSquareOn] = useState<Side | null>(null)
   const [available, setAvailable] = useState(true)
+  /** Lens angle the menu shows; re-read whenever the menu opens, so a saved view's camera shows through. */
+  const [fovDeg, setFovDeg] = useState(() => viewer.camera3dState()?.fovDeg ?? 45)
+  /** Whether the walk holds: pressed while W A S D walk the camera (it also starts from the keyboard, so the viewer is the one to ask). */
+  const [walking, setWalking] = useState(() => viewer.walking())
+  /** The walk's pace, as the slider shows it (the wheel turns it too, so the viewer is the one to ask). */
+  const [speed, setSpeed] = useState(() => viewer.walkSpeed())
+
+  useEffect(() => viewer.onWalkChange(setWalking), [viewer])
+  useEffect(() => viewer.onWalkSpeedChange(setSpeed), [viewer])
 
   const follow = useCallback(() => {
     const o = viewer.orientation()
@@ -116,6 +130,7 @@ export function OrientationControls({ viewer, rightInset, canCreateViews, blocke
       data-testid="orientation-controls"
       data-square-on={squareOn ?? ''}
       data-projection={projection}
+      data-walking={walking ? 'true' : 'false'}
     >
       <OrientationBall viewer={viewer} />
       <div className="flex items-center gap-1 rounded-md border bg-background/95 p-0.5 shadow-sm" role="toolbar" aria-label="View orientation">
@@ -126,6 +141,34 @@ export function OrientationControls({ viewer, rightInset, canCreateViews, blocke
             </Button>
           </TooltipTrigger>
           <TooltipContent>Home: everything in view from the south-east (F)</TooltipContent>
+        </Tooltip>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <span>
+              <Button
+                variant={walking ? 'secondary' : 'ghost'}
+                size="icon-sm"
+                disabled={projection === 'orthographic'}
+                aria-label="Walk the model"
+                aria-pressed={walking}
+                data-testid="orientation-walk"
+                onClick={(e) => {
+                  viewer.setWalk(!walking)
+                  // The keyboard belongs to the walk now: Space must not press this button again.
+                  e.currentTarget.blur()
+                }}
+              >
+                <Footprints />
+              </Button>
+            </span>
+          </TooltipTrigger>
+          <TooltipContent>
+            {projection === 'orthographic'
+              ? `Walk mode needs perspective projection. Switch to perspective (${PROJECTION_SHORTCUT}) to walk.`
+              : walking
+                ? 'Walking: drag to look around. Right-button + scroll sets the speed. Esc stops.'
+                : 'Walk: W A S D move, E and Q go up and down, drag to look around (W)'}
+          </TooltipContent>
         </Tooltip>
         <Tooltip>
           <TooltipTrigger asChild>
@@ -162,7 +205,11 @@ export function OrientationControls({ viewer, rightInset, canCreateViews, blocke
           </TooltipTrigger>
           <TooltipContent>True north is {trueNorthDeg}° clockwise from plan north. Set it under Manage › True north.</TooltipContent>
         </Tooltip>
-        <DropdownMenu>
+        <DropdownMenu onOpenChange={(open) => {
+          if (!open) return
+          const camera = viewer.camera3dState()
+          if (camera) setFovDeg(camera.fovDeg)
+        }}>
           <DropdownMenuTrigger asChild>
             <Button variant="ghost" size="icon-sm" aria-label="Orientation options">
               <ChevronDown />
@@ -202,6 +249,43 @@ export function OrientationControls({ viewer, rightInset, canCreateViews, blocke
                 </DropdownMenuRadioItem>
               ))}
             </DropdownMenuRadioGroup>
+            {/* A plain row, not a menu item: dragging the slider must not close the menu. */}
+            <div
+              className="px-2 py-1.5"
+              data-testid="orientation-fov"
+              onKeyDown={(e) => {
+                if (SLIDER_ADJUST_KEYS.has(e.key)) e.stopPropagation()
+              }}
+            >
+              <div className={cn('flex items-center justify-between gap-2 pb-1.5', projection === 'orthographic' && 'opacity-60')}>
+                <span
+                  className="text-xs font-normal text-muted-foreground"
+                  title="The perspective camera's lens angle. An orthographic view is not affected until you switch back to perspective."
+                >
+                  Field of view
+                </span>
+                <span className="font-mono text-xs text-muted-foreground">{Math.round(fovDeg)}&deg;</span>
+              </div>
+              <Slider
+                value={[fovDeg]}
+                min={5}
+                max={120}
+                step={1}
+                disabled={projection === 'orthographic'}
+                aria-label="Field of view in degrees"
+                onValueChange={(values) => {
+                  const next = values[0]
+                  if (next === undefined) return
+                  setFovDeg(next)
+                  viewer.setFovDeg(next, { settle: false })
+                }}
+                onValueCommit={(values) => {
+                  const next = values[0]
+                  if (next === undefined) return
+                  viewer.setFovDeg(next, { settle: true })
+                }}
+              />
+            </div>
             <DropdownMenuSeparator />
             <DropdownMenuGroup>
               <DropdownMenuItem disabled={!canCreateViews || !onTop} onSelect={onCreatePlan}>
@@ -216,6 +300,33 @@ export function OrientationControls({ viewer, rightInset, canCreateViews, blocke
           </DropdownMenuContent>
         </DropdownMenu>
       </div>
+      {/* Only while walking: the pace, as a multiple of the distance-led speed. The slider works in log terms, so its middle is 100% and every step feels the same. */}
+      {walking && (
+        <div
+          className="w-44 rounded-md border bg-background/95 p-1.5 shadow-sm"
+          data-testid="orientation-walk-speed"
+          onKeyDown={(e) => {
+            if (SLIDER_ADJUST_KEYS.has(e.key)) e.stopPropagation()
+          }}
+        >
+          <div className="flex items-center justify-between gap-2 pb-1">
+            <span className="text-xs font-normal text-muted-foreground">Walk speed</span>
+            <span className="font-mono text-xs text-muted-foreground">{Math.round(speed * 100)}%</span>
+          </div>
+          <Slider
+            value={[Math.log10(speed)]}
+            min={-1}
+            max={1}
+            step={0.05}
+            aria-label="Walk speed"
+            onValueChange={(values) => {
+              const next = values[0]
+              if (next === undefined) return
+              viewer.setWalkSpeed(Math.pow(10, next))
+            }}
+          />
+        </div>
+      )}
       {(onTop || side) && (
         <Tooltip>
           <TooltipTrigger asChild>

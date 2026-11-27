@@ -7,7 +7,7 @@ metadata:
   pack: "core"
   mcp-server: "mutinybim"
   family: "core"
-  token-cap: "3500"
+  token-cap: "4300"
   tools: "bim_script_reference bim_check_output bim_run_script bim_apply_output bim_save_part_type bim_model_summary bim_query_elements bim_inspect_network bim_validation_issues"
 ---
 
@@ -60,9 +60,17 @@ commands, one undo step) or **part types**. The core tools are:
    function, a command or the reads: it costs far less than a failed
    preview. Fix every finding and read the warnings.
 5. **`bim_run_script`**. A failure names the script's line ("Line 14: Step 3
-   (route_run) was refused: …"). Tell the person in plain words what the
+   (route_run) was refused: …"). Pass `clashes: true` (touched hard, self,
+   clearance, dedicated-space, and ceiling clashes) or `clashes: { scope:
+   "touched" | "level" | "all", types: ["hard", "self", "soft", "clearance",
+   "dedicated_space", "ceiling", "placement", "connectors"], min_severity:
+   "error" | "warning", detail: "summary" | "compact" | "full",
+   tolerance_in, soft_clearance_in, structure_clearance_in, max_findings }`
+   for immediate clash feedback on the previewed edits without saving. Inside
+   a script, `checks.clashes(ctx, spec)` and `checks.clashReport(ctx, spec)`
+   support the same filters. Tell the person in plain words what the
    preview does: how many things it creates, changes and deletes, the label,
-   any check that failed; for part types, each part and its connectors.
+   any check or clash that surfaced; for part types, each part and its connectors.
 6. **Approve.** Only when the status is `previewed`, call the tool in
    `apply_with.tool` with `apply_with.args` **unchanged** (`bim_apply_output`
    for edits, `bim_save_part_type` for parts, with `save_as` filled in). It
@@ -112,7 +120,8 @@ single calls. Use a family's single tools for one or two edits.
   pipe ones too (`plumbing_gas.sweat`, `plumbing_gas.threaded`, …).
 - `building.level`, `building.walls`, `building.floor`, `building.door`,
   `building.window`, `building.space`, `building.spaceInWalls`,
-  `building.ceiling` (outline and height as `units.*` values).
+  `building.ceiling` (outline, height, and optional real-scale ACT `grid`: `{ preset: "2x4" | "2x2" }` or custom `spacingX`/`spacingY`, `origin`, `rotationDeg`),
+  `building.ceilingTileCenter` (snaps 2'×4' troffers to full tile centers and 2'×2' HVAC diffusers/grilles via `{ deviceWidth: units.in(24), deviceDepth: units.in(24) }` inside 2'×4' bays).
 - **Level arguments are level ids** (from `building.level` or
   `ctx.model.levels()` with `reads.levels: true`). The kit's helpers also take
   the name of exactly one level the script read; raw `ctx.edit` commands take
@@ -199,6 +208,11 @@ These hold here and in every family.
 - **Look at what you drew.** After anything that changes a drawing, look at
   it (the `model` family's `bim_render_view_image` and
   `bim_render_sheet_image`) before saying it is done.
+- **Branches.** `bim_model_summary` reports `current_branch` (or `null` on Main)
+  and `branches` (existing branches on the model). When the person asks to work
+  on an existing branch they created, check `branches` first and switch onto it
+  with `bim_set_active_group_and_phase` (`branch: { checkout: "<name or id>" }`,
+  or `"main"` to return to Main) instead of creating a duplicate branch.
 - **Locked groups.** Nothing in a locked group can be created, changed,
   moved or deleted, by anyone, agents included. Report the refusal word for
   word and ask whether to unlock it; never unlock a group unless the person

@@ -37,8 +37,34 @@ function letter(t: string, size = 90): SymbolPrimitive {
 /** A wall-mounted cabinet sitting 300 mm up, front face on the insertion line (like the 208 V panelboard). */
 const CABINET: Pick<PartTypeDefinition, "geometry" | "symbol"> = {
   geometry: [{ kind: "box", center: [0, half("depth"), { param: "height", scale: 0.5, add: 300 }], size: [p("width"), p("depth"), p("height")] }],
-  symbol: [{ kind: "rect", center: [0, half("depth")], size: [p("width"), p("depth")] }, { kind: "line", from: [{ param: "width", scale: -0.5 }, p("depth")], to: [half("width"), p("depth")] }],
+  symbol: [
+    { kind: "rect", center: [0, half("depth")], size: [p("width"), p("depth")], fill: "mask", pen: "medium", minPaperMm: 4.5 },
+    { kind: "rect", center: [0, { param: "depth", scale: 0.75 }], size: [p("width"), { param: "depth", scale: 0.5 }], fill: "solid", pen: "medium" },
+  ],
 };
+
+/** ANSI/NEC paper-scaled wall-mounted duplex receptacle: prongs start flush at the wall face (y = 0) and extend into the room (+Y) through the masked circle. */
+function duplexSymbol(subscript?: string): SymbolPrimitive[] {
+  return [
+    { kind: "circle", center: [0, 2.0], radius: 1.5, fill: "mask", pen: "medium", units: "paper" },
+    { kind: "line", from: [-0.6, 0], to: [-0.6, 3.35], pen: "medium", units: "paper" },
+    { kind: "line", from: [0.6, 0], to: [0.6, 3.35], pen: "medium", units: "paper" },
+    ...(subscript ? [{ kind: "text" as const, at: [0, 2.0] as [number, number], uprightOffset: [2.05, 0] as [number, number], text: subscript, heightMm: 1.35, anchor: "start" as const, mask: true, units: "paper" as const }] : []),
+  ];
+}
+
+/** ANSI/NEC paper-scaled wall-mounted switch ($): crisp perpendicular stem touches wall face (y = 0) and swings with the wall normal while upright $ & subscripts stay clear of the wall on all 4 orientations. */
+function switchSymbol(subscript?: string): SymbolPrimitive[] {
+  return [
+    { kind: "line", from: [0, 0], to: [0, 1.45], pen: "medium", units: "paper" },
+    { kind: "text", at: [0, 3.0], text: "S", heightMm: 2.5, mask: true, units: "paper" },
+    { kind: "line", from: [0.32, 1.65], to: [-0.32, 4.35], pen: "medium", units: "paper", upright: true },
+    ...(subscript ? [{ kind: "text" as const, at: [0, 3.0] as [number, number], uprightOffset: [1.15, -0.75] as [number, number], text: subscript, heightMm: 1.4, anchor: "start" as const, units: "paper" as const }] : []),
+  ];
+}
+
+const CONTROL_PROTOCOLS = ["line_voltage", "0-10v", "dali", "low_voltage"];
+const controlTypeParam = (def?: string): ParamDef => ({ name: "control_type", label: "Control wiring", kind: "choice", choices: CONTROL_PROTOCOLS, ...(def ? { default: def } : {}) });
 
 export function electricalStarterTypes(version: string): LibraryEntry[] {
   const SWITCH: LibraryEntry = {
@@ -47,12 +73,121 @@ export function electricalStarterTypes(version: string): LibraryEntry[] {
       familyName: "Switch, single pole",
       typeName: "20A 120/277V",
       category: "electrical_device",
-      typeParams: [num("voltage", "Voltage", "v"), num("rating", "Rating", "a")],
-      typeValues: { voltage: 120, rating: 20 },
-      instanceParams: [text("circuit", "Circuit"), text("switch_leg", "Controls")],
+      hosting: "wall_face",
+      typeParams: [num("voltage", "Voltage", "v"), num("rating", "Rating", "a"), text("device_role", "Device role")],
+      typeValues: { voltage: 120, rating: 20, device_role: "lighting_control" },
+      instanceParams: [text("circuit", "Circuit"), text("switch_leg", "Controls"), controlTypeParam("line_voltage")],
       connectors: [power("power", 50, p("voltage"), 1, 0)],
-      geometry: [{ kind: "box", center: [0, -10, 60], size: [70, 20, 115] }],
-      symbol: [letter("S", 140)],
+      geometry: [
+      { kind: "box", center: [0, -10, 60], size: [55, 20, 95] },
+      { kind: "box", center: [0, 3, 60], size: [70, 6, 115] },
+    ],
+      symbol: switchSymbol(),
+      tagFields: ["circuit"],
+      source: source(version),
+    },
+  };
+
+  const SWITCH_3WAY: LibraryEntry = {
+    id: "builtin:switch-three-way@1",
+    definition: {
+      familyName: "Switch, three-way",
+      typeName: "20A 120/277V",
+      category: "electrical_device",
+      hosting: "wall_face",
+      typeParams: [num("voltage", "Voltage", "v"), num("rating", "Rating", "a"), text("device_role", "Device role")],
+      typeValues: { voltage: 120, rating: 20, device_role: "lighting_control" },
+      instanceParams: [text("circuit", "Circuit"), text("switch_leg", "Controls"), controlTypeParam("line_voltage")],
+      connectors: [power("power", 50, p("voltage"), 1, 0)],
+      geometry: [
+      { kind: "box", center: [0, -10, 60], size: [55, 20, 95] },
+      { kind: "box", center: [0, 3, 60], size: [70, 6, 115] },
+    ],
+      symbol: switchSymbol("3"),
+      tagFields: ["circuit"],
+      source: source(version),
+    },
+  };
+
+  const SWITCH_4WAY: LibraryEntry = {
+    id: "builtin:switch-four-way@1",
+    definition: {
+      familyName: "Switch, four-way",
+      typeName: "20A 120/277V",
+      category: "electrical_device",
+      hosting: "wall_face",
+      typeParams: [num("voltage", "Voltage", "v"), num("rating", "Rating", "a"), text("device_role", "Device role")],
+      typeValues: { voltage: 120, rating: 20, device_role: "lighting_control" },
+      instanceParams: [text("circuit", "Circuit"), text("switch_leg", "Controls"), controlTypeParam("line_voltage")],
+      connectors: [power("power", 50, p("voltage"), 1, 0)],
+      geometry: [
+      { kind: "box", center: [0, -10, 60], size: [55, 20, 95] },
+      { kind: "box", center: [0, 3, 60], size: [70, 6, 115] },
+    ],
+      symbol: switchSymbol("4"),
+      tagFields: ["circuit"],
+      source: source(version),
+    },
+  };
+
+  const SWITCH_DIMMER: LibraryEntry = {
+    id: "builtin:switch-dimmer@1",
+    definition: {
+      familyName: "Switch, dimmer",
+      typeName: "0-10V / LED 120/277V",
+      category: "electrical_device",
+      hosting: "wall_face",
+      typeParams: [num("voltage", "Voltage", "v"), num("rating", "Rating", "a"), text("device_role", "Device role")],
+      typeValues: { voltage: 120, rating: 20, device_role: "lighting_control" },
+      instanceParams: [text("circuit", "Circuit"), text("switch_leg", "Controls"), controlTypeParam("0-10v")],
+      connectors: [power("power", 50, p("voltage"), 1, 0)],
+      geometry: [
+      { kind: "box", center: [0, -10, 60], size: [55, 20, 95] },
+      { kind: "box", center: [0, 3, 60], size: [70, 6, 115] },
+    ],
+      symbol: switchSymbol("D"),
+      tagFields: ["circuit"],
+      source: source(version),
+    },
+  };
+
+  const OCC_SENSOR: LibraryEntry = {
+    id: "builtin:occupancy-sensor-ceiling@1",
+    definition: {
+      familyName: "Occupancy sensor, ceiling",
+      typeName: "Dual-tech 120/277V",
+      category: "electrical_device",
+      hosting: "ceiling",
+      typeParams: [num("voltage", "Voltage", "v"), text("device_role", "Device role")],
+      typeValues: { voltage: 120, device_role: "lighting_control" },
+      instanceParams: [text("circuit", "Circuit"), text("switch_leg", "Controls"), controlTypeParam("low_voltage")],
+      connectors: [power("power", 0, p("voltage"), 1, 0)],
+      geometry: [{ kind: "cylinder", center: [0, 0, 20], radius: 55, height: 40, axis: "z" }],
+      symbol: [
+        { kind: "circle", center: [0, 0], radius: 1.8, fill: "mask", pen: "medium", units: "paper" },
+        { kind: "text", at: [0, 0], text: "OS", heightMm: 1.6, units: "paper" },
+      ],
+      tagFields: ["circuit"],
+      source: source(version),
+    },
+  };
+
+  const DAYLIGHT_SENSOR: LibraryEntry = {
+    id: "builtin:daylight-sensor@1",
+    definition: {
+      familyName: "Daylight sensor, ceiling",
+      typeName: "0-10V Closed-loop",
+      category: "electrical_device",
+      hosting: "ceiling",
+      typeParams: [num("voltage", "Voltage", "v"), text("device_role", "Device role")],
+      typeValues: { voltage: 24, device_role: "lighting_control" },
+      instanceParams: [text("circuit", "Circuit"), text("switch_leg", "Controls"), controlTypeParam("0-10v")],
+      connectors: [power("power", 0, p("voltage"), 1, 0)],
+      geometry: [{ kind: "cylinder", center: [0, 0, 20], radius: 45, height: 35, axis: "z" }],
+      symbol: [
+        { kind: "circle", center: [0, 0], radius: 1.8, fill: "mask", pen: "medium", units: "paper" },
+        { kind: "text", at: [0, 0], text: "DS", heightMm: 1.6, units: "paper" },
+      ],
       tagFields: ["circuit"],
       source: source(version),
     },
@@ -70,7 +205,10 @@ export function electricalStarterTypes(version: string): LibraryEntry[] {
       instanceParams: [num("voltage", "Voltage", "v", voltage), num("load", "Load", "va", va), num("mocp", "Maximum overcurrent protection", "a"), text("serves", "Serves"), text("circuit", "Circuit")],
       connectors: [power("power", 0, p("voltage"), poles, p("load"))],
       geometry: [{ kind: "box", center: [0, 0, half("size")], size: [p("size"), p("size"), p("size")] }],
-      symbol: [{ kind: "circle", center: [0, 0], radius: half("size") }, { kind: "line", from: [{ param: "size", scale: -0.35 }, { param: "size", scale: -0.35 }], to: [{ param: "size", scale: 0.35 }, { param: "size", scale: 0.35 }] }],
+      symbol: [
+        { kind: "circle", center: [0, 0], radius: 1.6, fill: "mask", pen: "medium", units: "paper" },
+        { kind: "polyline", points: [[-1.6, 0], [1.6, 0], [1.38, 0.8], [0.8, 1.38], [0, 1.6], [-0.8, 1.38], [-1.38, 0.8]], closed: true, fill: "solid", pen: "thin", units: "paper" },
+      ],
       tagFields: ["mark", "circuit"],
       source: source(version),
     },
@@ -103,6 +241,19 @@ export function electricalStarterTypes(version: string): LibraryEntry[] {
         ],
         connectors: [power("feeder", p("height"), p("voltage"), 3, 0)],
         ...CABINET,
+        clearances: [
+          {
+            id: "working_space",
+            name: "NEC 110.26 WORKING SPACE",
+            purpose: "working_space",
+            face: "left",
+            depth: (typeValues.voltage >= 480 ? 42 : 36) * IN,
+            width: size[0] < 30 ? 30 * IN : p("width"),
+            height: 78 * IN,
+            fromFloor: true,
+            cite: "NEC 110.26(A)(1)",
+          },
+        ],
         tagFields: ["panel_name"],
         source: source(version),
       },
@@ -129,7 +280,7 @@ export function electricalStarterTypes(version: string): LibraryEntry[] {
     },
   };
 
-  return [SWITCH, equipmentConnection(1, 120, 1000), equipmentConnection(2, 208, 3000), equipmentConnection(3, 208, 5000), PANEL_480, SWITCHBOARD, TRANSFORMER, makeupAirUnit(version), ...distributionTypes(version), ...deviceTypes(version)];
+  return [SWITCH, SWITCH_3WAY, SWITCH_4WAY, SWITCH_DIMMER, OCC_SENSOR, DAYLIGHT_SENSOR, equipmentConnection(1, 120, 1000), equipmentConnection(2, 208, 3000), equipmentConnection(3, 208, 5000), PANEL_480, SWITCHBOARD, TRANSFORMER, makeupAirUnit(version), ...distributionTypes(version), ...deviceTypes(version)];
 }
 
 function makeupAirUnitV1(version: string): LibraryEntry {
@@ -332,18 +483,30 @@ function distributionTypes(version: string): LibraryEntry[] {
     },
   };
 
+  const disconnectSymbol = (fused: boolean): SymbolPrimitive[] => [
+    // ANSI/NECA 100 wall-mounted safety disconnect switch: wall face sits on y = 0, box projects into room (+y).
+    // Thin wall-side mounting bar clearly indicates wall orientation on all 4 sides without obscuring upright DS/DF text.
+    { kind: "rect", center: [0, 2.0], size: [5.4, 4.0], fill: "mask", pen: "medium", units: "paper" },
+    { kind: "rect", center: [0, 0.35], size: [5.4, 0.7], fill: "solid", pen: "medium", units: "paper" },
+    ...(fused
+      ? [{ kind: "line" as const, from: [-2.7, 0.7] as [number, number], to: [-1.7, 1.7] as [number, number], pen: "thin" as const, units: "paper" as const }]
+      : []),
+    { kind: "text", at: [0, 2.35], text: fused ? "DF" : "DS", heightMm: 1.75, units: "paper" },
+  ];
+
   const disconnect = (fused: boolean, amps: number, fuseA: number | null, enclosure: string): LibraryEntry => ({
     id: `builtin:disconnect-${fused ? "fused" : "nf"}-${amps}-480@1`,
     definition: {
       familyName: fused ? "Disconnect switch, fused" : "Disconnect switch, non-fused",
       typeName: `${amps}A 600V 3P${fused ? `, ${fuseA}A fuses` : ""}, ${enclosure}`,
       category: "electrical_equipment",
+      hosting: "wall_face",
       typeParams: [length("width", "Width"), length("height", "Height"), length("depth", "Depth"), num("bus_rating", "Switch rating", "a"), num("voltage", "System voltage", "v"), choice("phases", "Phases", ["1", "3"]), choice("enclosure", "Enclosure", ["NEMA 1", "NEMA 3R", "NEMA 4X"]), ...(fused ? [num("fuse_rating", "Fuses", "a")] : [])],
       typeValues: { width: 8 * IN, height: 14 * IN, depth: 5 * IN, bus_rating: amps, voltage: 480, phases: "3", enclosure, ...(fused && fuseA !== null ? { fuse_rating: fuseA } : {}) },
       instanceParams: [text("panel_name", "Name"), text("serves", "Serves")],
       connectors: [{ ...power("line", p("height"), p("voltage"), 3, 0), label: "Line" }],
-      ...CABINET,
-      symbol: [...(CABINET.symbol ?? []), { kind: "text", at: [0, half("depth")], text: fused ? "DF" : "DS", heightMm: 70 }],
+      geometry: CABINET.geometry,
+      symbol: disconnectSymbol(fused),
       tagFields: ["panel_name"],
       source: source(version),
     },
@@ -375,18 +538,36 @@ function distributionTypes(version: string): LibraryEntry[] {
  */
 function deviceTypes(version: string): LibraryEntry[] {
   // Mounting height is where it is placed (the placement height); `mounting` only says where it goes.
-  const receptacle = (id: string, familyName: string, typeName: string, load: number, gfci: boolean, mounting: string, mark: SymbolPrimitive[]): LibraryEntry => ({
+  const WALL_BOX_GEOMETRY: PartTypeDefinition["geometry"] = [
+    { kind: "box", center: [0, -10, 60], size: [55, 20, 95] },
+    { kind: "box", center: [0, 3, 60], size: [70, 6, 115] },
+  ];
+  const FLOOR_BOX_GEOMETRY: PartTypeDefinition["geometry"] = [
+    { kind: "box", center: [0, 0, -40], size: [120, 120, 80] },
+    { kind: "box", center: [0, 0, 2], size: [140, 140, 4] },
+  ];
+  const receptacle = (
+    id: string,
+    familyName: string,
+    typeName: string,
+    load: number,
+    gfci: boolean,
+    mounting: string,
+    symbol: SymbolPrimitive[],
+    opts?: { readonly hosting?: PartTypeDefinition["hosting"]; readonly geometry?: PartTypeDefinition["geometry"] },
+  ): LibraryEntry => ({
     id,
     definition: {
       familyName,
       typeName,
       category: "electrical_device",
+      hosting: opts?.hosting ?? (mounting === "Floor" ? "floor" : mounting === "Ceiling" ? "ceiling" : "wall_face"),
       typeParams: [num("voltage", "Voltage", "v"), num("rating", "Rating", "a"), text("nema", "NEMA configuration"), text("mounting", "Mounting")],
       typeValues: { voltage: 120, rating: 20, nema: "5-20R", mounting },
-      instanceParams: [text("circuit", "Circuit"), num("load", "Load", "va", load), yesNo("gfci", "GFCI", gfci), CONNECTION_TYPE],
+      instanceParams: [text("circuit", "Circuit"), text("switch_leg", "Switch leg"), num("load", "Load", "va", load), yesNo("gfci", "GFCI", gfci), CONNECTION_TYPE],
       connectors: [{ ...power("power", 50, p("voltage"), 1, p("load")), loadClass: "receptacle" }],
-      geometry: [{ kind: "box", center: [0, -10, 60], size: [70, 20, 115] }],
-      symbol: [{ kind: "circle", center: [0, 0], radius: 100 }, { kind: "line", from: [-60, -40], to: [-60, 40] }, { kind: "line", from: [60, -40], to: [60, 40] }, ...mark],
+      geometry: opts?.geometry ?? (mounting === "Floor" ? FLOOR_BOX_GEOMETRY : WALL_BOX_GEOMETRY),
+      symbol,
       tagFields: ["circuit"],
       source: source(version),
     },
@@ -400,7 +581,15 @@ function deviceTypes(version: string): LibraryEntry[] {
       category: "lighting_fixture",
       typeParams: [length("length", "Length"), length("width", "Width"), num("watts", "Input power", "w"), num("voltage", "Voltage", "v")],
       typeValues: { length: size[0], width: size[1], watts, voltage },
-      instanceParams: [text("circuit", "Circuit"), text("switch_leg", "Switch leg"), yesNo("emergency", "Emergency battery", emergency), text("type_mark", "Fixture type"), CONNECTION_TYPE],
+      instanceParams: [
+        text("circuit", "Circuit"),
+        text("switch_leg", "Switch leg"),
+        yesNo("emergency", "Emergency battery", emergency),
+        { ...choice("emergency_mode", "Emergency mode", ["none", "unswitched", "switched"]), default: emergency ? "unswitched" : "none" },
+        controlTypeParam("line_voltage"),
+        text("type_mark", "Fixture type"),
+        CONNECTION_TYPE,
+      ],
       connectors: [{ ...power("power", 100, p("voltage"), 1, p("watts")), loadClass: "lighting", continuous: true }],
       geometry: [{ kind: "box", center: [0, 0, 60], size: [p("length"), p("width"), 120] }],
       symbol,
@@ -409,15 +598,147 @@ function deviceTypes(version: string): LibraryEntry[] {
     },
   });
 
+  /** Left-half semicircle polygon of radius `r` for ANSI/NEC emergency downlight shading. */
+  const halfCircleLeft = (r: number, steps = 16): Array<[number, number]> =>
+    Array.from({ length: steps + 1 }, (_, i) => {
+      const a = Math.PI / 2 + (Math.PI * i) / steps;
+      return [Number((r * Math.cos(a)).toFixed(3)), Number((r * Math.sin(a)).toFixed(3))] as [number, number];
+    });
+
   return [
-    receptacle("builtin:quad-receptacle@1", "Receptacle, quad", "20A 125V NEMA 5-20R, two duplexes", 360, false, "Wall", [{ kind: "line", from: [-90, 0], to: [90, 0] }]),
-    receptacle("builtin:gfci-receptacle@1", "Receptacle, GFCI duplex", "20A 125V NEMA 5-20R GFCI", 180, true, "Wall", [letter("GFI", 60)]),
-    receptacle("builtin:countertop-receptacle@1", "Receptacle, countertop GFCI", "20A 125V NEMA 5-20R GFCI, above counter", 180, true, "Above counter", [letter("C", 60)]),
-    receptacle("builtin:floor-receptacle@1", "Receptacle, floor box", "20A 125V NEMA 5-20R in floor box", 180, false, "Floor", [{ kind: "rect", center: [0, 0], size: [240, 240] }]),
-    receptacle("builtin:ceiling-receptacle@1", "Receptacle, ceiling", "20A 125V NEMA 5-20R, ceiling mounted", 180, false, "Ceiling", [letter("CLG", 50)]),
-    light("builtin:downlight-6-led@1", "Downlight, recessed LED", '6", 1500 lm', 15, 277, false, [7 * IN, 7 * IN], [{ kind: "circle", center: [0, 0], radius: 3.5 * IN }]),
-    light("builtin:troffer-2x4-led-em@1", "Troffer, recessed LED", "2x4, 4000 lm, emergency battery", 32, 277, true, [4 * FT_MM, 2 * FT_MM], [{ kind: "rect", center: [0, 0], size: [4 * FT_MM, 2 * FT_MM] }, { kind: "line", from: [-2 * FT_MM, 0], to: [2 * FT_MM, 0] }, letter("EM", 120)]),
-    light("builtin:exit-sign-led@1", "Exit sign, LED", "Single face, battery", 2, 277, true, [12 * IN, 2 * IN], [{ kind: "rect", center: [0, 0], size: [12 * IN, 3 * IN] }, letter("EXIT", 60)]),
+    // Standard ANSI/IEEE single-circle quad receptacle (two vertical wall blades + two perpendicular horizontal blades)
+    receptacle("builtin:quad-receptacle@1", "Receptacle, quad", "20A 125V NEMA 5-20R, quadplex", 360, false, "Wall", [
+      { kind: "circle", center: [0, 2.0], radius: 1.55, fill: "mask", pen: "medium", units: "paper" },
+      { kind: "line", from: [-0.55, 0], to: [-0.55, 3.45], pen: "medium", units: "paper" },
+      { kind: "line", from: [0.55, 0], to: [0.55, 3.45], pen: "medium", units: "paper" },
+      { kind: "line", from: [-1.45, 1.45], to: [1.45, 1.45], pen: "medium", units: "paper" },
+      { kind: "line", from: [-1.45, 2.55], to: [1.45, 2.55], pen: "medium", units: "paper" },
+    ]),
+    receptacle("builtin:gfci-receptacle@1", "Receptacle, GFCI duplex", "20A 125V NEMA 5-20R GFCI", 180, true, "Wall", duplexSymbol("GFI")),
+    receptacle("builtin:controlled-receptacle@1", "Receptacle, controlled duplex", "20A 125V NEMA 5-20R ASHRAE 90.1 half-controlled", 180, false, "Wall", [
+      { kind: "circle", center: [0, 2.0], radius: 1.5, fill: "mask", pen: "medium", units: "paper" },
+      { kind: "polyline", points: [[-1.5, 2.0], [1.5, 2.0], [1.3, 2.75], [0.75, 3.3], [0, 3.5], [-0.75, 3.3], [-1.3, 2.75]], closed: true, fill: "solid", pen: "thin", units: "paper" },
+      { kind: "line", from: [-0.6, 0], to: [-0.6, 3.35], pen: "medium", units: "paper" },
+      { kind: "line", from: [0.6, 0], to: [0.6, 3.35], pen: "medium", units: "paper" },
+      { kind: "text", at: [0, 2.0], uprightOffset: [2.05, 0], text: "C", heightMm: 1.35, anchor: "start", mask: true, units: "paper" },
+    ]),
+    receptacle("builtin:countertop-receptacle@1", "Receptacle, countertop GFCI", "20A 125V NEMA 5-20R GFCI, above counter", 180, true, "Above counter", duplexSymbol("GFI/C")),
+    receptacle("builtin:floor-receptacle@1", "Receptacle, floor box", "20A 125V NEMA 5-20R in floor box", 180, false, "Floor", [
+      { kind: "rect", center: [0, 0], size: [4.4, 4.4], fill: "mask", pen: "medium", units: "paper" },
+      { kind: "circle", center: [0, 0], radius: 1.4, fill: "mask", pen: "medium", units: "paper" },
+      { kind: "line", from: [-0.55, -1.8], to: [-0.55, 1.3], pen: "medium", units: "paper" },
+      { kind: "line", from: [0.55, -1.8], to: [0.55, 1.3], pen: "medium", units: "paper" },
+    ], { hosting: "floor", geometry: FLOOR_BOX_GEOMETRY }),
+    receptacle("builtin:floor-receptacle-quad@1", "Receptacle, quad floor box", "20A 125V NEMA 5-20R quad in floor box", 360, false, "Floor", [
+      { kind: "rect", center: [0, 0], size: [4.6, 4.6], fill: "mask", pen: "medium", units: "paper" },
+      { kind: "circle", center: [0, 0], radius: 1.5, fill: "mask", pen: "medium", units: "paper" },
+      { kind: "line", from: [-0.55, -1.4], to: [-0.55, 1.4], pen: "medium", units: "paper" },
+      { kind: "line", from: [0.55, -1.4], to: [0.55, 1.4], pen: "medium", units: "paper" },
+      { kind: "line", from: [-1.4, -0.55], to: [1.4, -0.55], pen: "medium", units: "paper" },
+      { kind: "line", from: [-1.4, 0.55], to: [1.4, 0.55], pen: "medium", units: "paper" },
+    ], { hosting: "floor", geometry: FLOOR_BOX_GEOMETRY }),
+    receptacle("builtin:ceiling-receptacle@1", "Receptacle, ceiling", "20A 125V NEMA 5-20R, ceiling mounted", 180, false, "Ceiling", duplexSymbol("CLG")),
+    // Special-purpose NEMA & hardwired connection symbols (standard CAD graphics with uprightOffset so flipped walls keep labels readable)
+    {
+      id: "builtin:receptacle-nema-6-20r@1",
+      definition: {
+        familyName: "Receptacle, 240V NEMA 6-20R",
+        typeName: "20A 208/240V 2-pole",
+        category: "electrical_device",
+        hosting: "wall_face",
+        typeParams: [num("voltage", "Voltage", "v"), num("rating", "Rating", "a"), text("nema", "NEMA configuration"), text("mounting", "Mounting")],
+        typeValues: { voltage: 208, rating: 20, nema: "6-20R", mounting: "Wall" },
+        instanceParams: [text("circuit", "Circuit"), num("load", "Load", "va", 1500), yesNo("gfci", "GFCI", false), CONNECTION_TYPE],
+        connectors: [{ ...power("power", 50, p("voltage"), 2, p("load")), loadClass: "receptacle" }],
+        geometry: WALL_BOX_GEOMETRY,
+        symbol: [
+          { kind: "circle", center: [0, 2.0], radius: 1.5, fill: "mask", pen: "medium", units: "paper" },
+          { kind: "line", from: [-0.75, 0], to: [-0.75, 3.45], pen: "medium", units: "paper" },
+          { kind: "line", from: [0.75, 0], to: [0.75, 3.45], pen: "medium", units: "paper" },
+          { kind: "line", from: [-1.5, 2.0], to: [1.5, 2.0], pen: "medium", units: "paper" },
+          { kind: "text", at: [0, 2.0], uprightOffset: [2.05, 0], text: "240V", heightMm: 1.35, anchor: "start", mask: true, units: "paper" },
+        ],
+        tagFields: ["circuit"],
+        source: source(version),
+      },
+    },
+    {
+      id: "builtin:receptacle-twist-lock@1",
+      definition: {
+        familyName: "Receptacle, twist-lock",
+        typeName: "20A 208/240V NEMA L6-20R locking",
+        category: "electrical_device",
+        hosting: "wall_face",
+        typeParams: [num("voltage", "Voltage", "v"), num("rating", "Rating", "a"), text("nema", "NEMA configuration"), text("mounting", "Mounting")],
+        typeValues: { voltage: 208, rating: 20, nema: "L6-20R", mounting: "Wall" },
+        instanceParams: [text("circuit", "Circuit"), num("load", "Load", "va", 1500), yesNo("gfci", "GFCI", false), CONNECTION_TYPE],
+        connectors: [{ ...power("power", 50, p("voltage"), 2, p("load")), loadClass: "receptacle" }],
+        geometry: WALL_BOX_GEOMETRY,
+        symbol: [
+          { kind: "circle", center: [0, 2.0], radius: 1.5, fill: "mask", pen: "medium", units: "paper" },
+          { kind: "line", from: [-0.65, 0], to: [-0.65, 3.45], pen: "medium", units: "paper" },
+          { kind: "line", from: [0.65, 0], to: [0.65, 3.45], pen: "medium", units: "paper" },
+          { kind: "line", from: [-1.05, 3.0], to: [1.05, 1.0], pen: "thin", units: "paper" },
+          { kind: "text", at: [0, 2.0], uprightOffset: [2.05, 0], text: "TL", heightMm: 1.35, anchor: "start", mask: true, units: "paper" },
+        ],
+        tagFields: ["circuit"],
+        source: source(version),
+      },
+    },
+    {
+      id: "builtin:hardwired-connection@1",
+      definition: {
+        familyName: "Equipment connection, hardwired",
+        typeName: "Junction box & flexible whip",
+        category: "electrical_device",
+        hosting: "wall_face",
+        typeParams: [num("voltage", "Voltage", "v"), num("rating", "Rating", "a"), text("mounting", "Mounting")],
+        typeValues: { voltage: 208, rating: 20, mounting: "Wall" },
+        instanceParams: [text("circuit", "Circuit"), num("load", "Load", "va", 1800), CONNECTION_TYPE],
+        connectors: [{ ...power("power", 50, p("voltage"), 2, p("load")), loadClass: "equipment" }],
+        geometry: WALL_BOX_GEOMETRY,
+        symbol: [
+          { kind: "circle", center: [0, 1.6], radius: 1.4, fill: "mask", pen: "medium", units: "paper" },
+          { kind: "line", from: [0, 0], to: [0, 0.2], pen: "medium", units: "paper" },
+          { kind: "text", at: [0, 1.6], text: "J", heightMm: 1.45, anchor: "middle", units: "paper" },
+          // Smooth S-curved flexible conduit whip tail emerging from the J-box
+          { kind: "polyline", points: [[1.4, 1.6], [1.85, 1.95], [2.25, 2.05], [2.65, 1.75], [3.0, 1.35], [3.4, 1.3], [3.8, 1.6]], closed: false, pen: "thin", units: "paper" },
+        ],
+        tagFields: ["circuit"],
+        source: source(version),
+      },
+    },
+    light("builtin:downlight-6-led@1", "Downlight, recessed LED", '6", 1500 lm', 15, 277, false, [7 * IN, 7 * IN], [
+      { kind: "circle", center: [0, 0], radius: 1.8, fill: "mask", pen: "medium", units: "paper", detailLevels: ["coarse", "medium"] },
+      { kind: "polyline", points: halfCircleLeft(1.8), closed: true, fill: "solid", pen: "thin", units: "paper", detailLevels: ["coarse", "medium"], when: { param: "emergency", truthy: true } },
+      { kind: "circle", center: [0, 0], radius: 3.5 * IN, fill: "mask", pen: "medium", detailLevels: ["fine"] },
+      { kind: "polyline", points: halfCircleLeft(3.5 * IN), closed: true, fill: "solid", pen: "thin", detailLevels: ["fine"], when: { param: "emergency", truthy: true } },
+      { kind: "circle", center: [0, 0], radius: 2.5 * IN, pen: "thin", detailLevels: ["fine"] },
+    ]),
+    light("builtin:troffer-2x4-led-em@1", "Troffer, recessed LED", "2x4, 4000 lm, emergency battery", 32, 277, true, [4 * FT_MM, 2 * FT_MM], [
+      { kind: "rect", center: [0, 0], size: [4 * FT_MM, 2 * FT_MM], fill: "mask", pen: "medium", minPaperMm: 4 },
+      { kind: "rect", center: [-1 * FT_MM, 0], size: [2 * FT_MM, 2 * FT_MM], fill: "solid", pen: "medium" },
+      { kind: "line", from: [-2 * FT_MM, 0], to: [2 * FT_MM, 0], pen: "thin", detailLevels: ["medium", "fine"] },
+    ]),
+    light("builtin:exit-sign-led@1", "Exit sign, LED", "Single face, battery", 2, 277, true, [12 * IN, 2 * IN], [
+      { kind: "circle", center: [0, 0], radius: 1.8, fill: "mask", pen: "medium", units: "paper" },
+      { kind: "polyline", points: [[0, 0], [1.8, 0], [1.56, 0.9], [0.9, 1.56], [0, 1.8]], closed: true, fill: "solid", pen: "thin", units: "paper" },
+      { kind: "polyline", points: [[0, 0], [-1.8, 0], [-1.56, -0.9], [-0.9, -1.56], [0, -1.8]], closed: true, fill: "solid", pen: "thin", units: "paper" },
+    ]),
+    light("builtin:linear-pendant-led@1", "Linear pendant, LED", "4 ft direct/indirect, 4200 lm", 36, 277, false, [4 * FT_MM, 4 * IN], [
+      { kind: "rect", center: [0, 0], size: [4 * FT_MM, 4 * IN], fill: "mask", pen: "medium", minPaperMm: 4 },
+      { kind: "line", from: [-2 * FT_MM, 0], to: [2 * FT_MM, 0], pen: "thin" },
+    ]),
+    light("builtin:exit-combo-wall-pack@1", "Exit / emergency combo, LED", "Dual head egress combo, 450 lm, battery", 4, 277, true, [16 * IN, 4 * IN], [
+      { kind: "rect", center: [0, 0], size: [4.2, 2.0], fill: "mask", pen: "medium", units: "paper" },
+      { kind: "circle", center: [-2.4, 0], radius: 0.7, fill: "solid", pen: "thin", units: "paper" },
+      { kind: "circle", center: [2.4, 0], radius: 0.7, fill: "solid", pen: "thin", units: "paper" },
+      { kind: "text", at: [0, 0], text: "EX", heightMm: 1.2, anchor: "middle", units: "paper" },
+    ]),
+    light("builtin:exterior-wall-pack-led@1", "Exterior wall pack, LED", "Full-cutoff egress sconce, 1800 lm", 15, 120, true, [10 * IN, 6 * IN], [
+      { kind: "rect", center: [0, 0], size: [3.2, 2.2], fill: "mask", pen: "medium", units: "paper" },
+      { kind: "rect", center: [-0.8, 0], size: [1.6, 2.2], fill: "solid", pen: "thin", units: "paper", when: { param: "emergency", truthy: true } },
+    ]),
   ];
 }
 

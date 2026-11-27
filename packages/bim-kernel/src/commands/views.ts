@@ -1,14 +1,16 @@
 import { pushTo } from "../collections";
+import { cleanPolygon, polygonBounds } from "../drawing/polygon-clip";
 import { z } from "zod";
 import { convert } from "@permitzip/bim-units";
 import { canonicalJson } from "../canonical";
 import { sheetFigureSchema } from "../annotation/figures";
+import { sheetMarkupSpecSchema } from "../annotation/markups";
 import { recomputeDerivedAfter } from "../derived";
 import { peerReads } from "../elements/feature";
 import { parseLinkedElementKey } from "../reference-geometry/index-geometry";
 import { ANNOTATION_LINKED_ANCHORS_FEATURE } from "../reference-geometry/linked-anchors";
 import { TAGS_MASK_LEADER_FEATURE } from "../organization/model";
-import { DIAGRAM_FAULT_CURRENT_FEATURE } from "../diagrams/definition";
+import { DIAGRAM_FAULT_CURRENT_FEATURE, DIAGRAM_FILTERS_FEATURE, DIAGRAM_LINK_LOADS_FEATURE } from "../diagrams/definition";
 import { viewGraphicsHintsRefusal, viewGraphicsRowByKey, type ViewGraphicsHints } from "../layout/view-graphics-point";
 import {
   CUT_PATTERNS,
@@ -24,9 +26,17 @@ import {
   SCHEDULE_FILTER_OPS,
   TITLE_BLOCK_TYPES,
   VIEW_CATEGORIES,
+  VIEW_HIDDEN_ELEMENTS_FEATURE,
+  VIEW_RANGE_AND_BROWSER_FEATURE,
+  VIEW_TEMPLATE_LOCK_KEYS,
+  VIEW_TEMPLATES_FEATURE,
+  VIEW_TOP_REFS,
+  VIEWPORT_NORTH_ARROW_OFFSET_FEATURE,
   type DrawingItem,
   type SheetProps,
   type ViewProps,
+  type ViewTemplateElement,
+  type ViewTemplateProps,
   type Viewport,
 } from "../documents";
 import { titleBlockRowSchema } from "../drawing/title-block-definition";
@@ -60,7 +70,7 @@ import { noteLabel, richTextNoteSchema } from "../annotation/rich-text";
 import { executeTextNoteCommand, isTextNoteCommand, textNoteCommandSchemas } from "../annotation/text-note-commands";
 import { DOCUMENT_FIELDS, documentFieldValue, propValue } from "../document-fields";
 import { dimensionPointRange, dimSpecSchema, tagSpecNeedsMaskLeaderPeers, tagSpecSchema, tagStyleCategoryOf, type DimSpec, type TagSpec } from "../annotation/annotations";
-import { DRAFTING_CATEGORIES, battSpecSchema, componentPlacementSchema, detailComponent, detailPointRange, lineStyleSchema, regionFillSchema } from "../annotation/detailing";
+import { DRAFTING_CAD_STANDARDS_FEATURE, DRAFTING_CATEGORIES, battSpecSchema, componentPlacementSchema, detailComponent, detailPointRange, lineStyleSchema, regionFillNeedsCadStandards, regionFillSchema } from "../annotation/detailing";
 import { carryOrganization, organizationOf, viewOrganizationProblem } from "../organization/model";
 import { referenceDisplaySchema } from "../reference-display";
 import { boxFollowingPlanCrop, view3dPropsProblem, view3dPropsShape, withDefault3d, withoutWorking } from "../view3d";
@@ -70,6 +80,7 @@ import { UNIT_CODES, type UnitCode } from "../registry/units";
 import { diagramDefinitionSchema } from "../diagrams/definition";
 import { SYSTEM_LINE_PATTERNS } from "../routing/system-graphics";
 import { categoryOverridesWritable } from "../categories/feature";
+import { VIEW_SCHEMATIC_DETAIL_FEATURE, VIEW_SYMBOL_SCALE_FEATURE } from "../categories/types";
 import { isRegistryIdShape } from "../ids";
 import { diagramItemsOf } from "../diagrams/evaluate";
 import { diagramKindStoreRefusal } from "../diagrams/kinds";
@@ -104,6 +115,11 @@ const sectionSchema = z.object({
   end: vec2,
   direction: z.union([z.literal(1), z.literal(-1)]),
   depthMm: z.number().positive().max(300000),
+  headExtMm: z.number().finite().min(-50000).max(50000).optional(),
+  tailExtMm: z.number().finite().min(-50000).max(50000).optional(),
+  splitGap: z.boolean().optional(),
+  referencingViewId: id.optional(),
+  showInDisciplines: z.array(z.string().min(1).max(64)).max(20).readonly().optional(),
 });
 
 
@@ -190,7 +206,14 @@ export const scheduleV2Schema = z
   })
   .strict();
 
-const calloutSpecSchema = z.object({ viewId: id, label: z.string().trim().min(1).max(12).optional() }).strict();
+const calloutSpecSchema = z
+  .object({
+    viewId: id,
+    label: z.string().trim().min(1).max(12).optional(),
+    boundary: z.array(vec2).min(3).max(200).readonly().optional(),
+    showLabel: z.boolean().optional(),
+  })
+  .strict();
 
 const revisionsSchema = z
   .array(z.object({ number: z.string().trim().min(1).max(10), date: z.string().trim().min(1).max(20), description: z.string().trim().min(1).max(80) }).strict())
@@ -214,6 +237,8 @@ const categoryOverrideSchema = z
     planSymbol: z.boolean(),
     maskBeneath: z.boolean(),
     transparency: z.number().finite().min(0).max(1),
+    detailLevel: z.enum(["coarse", "medium", "fine"]),
+    singleLineBelowMm: z.number().finite().min(0).max(3000),
   })
   .partial()
   .strict();
@@ -229,15 +254,31 @@ const viewPropsPatchObject = z
     viewDepthMm: z.number().finite().min(0).max(30000),
     /** null: no lower limit again. */
     viewBottomMm: z.number().finite().min(-30000).max(30000).nullable(),
-    /** null: no upper limit again. */
-    viewTopMm: z.number().finite().min(0).max(60000).nullable(),
+    /** null: no upper limit again. Negative offsets are allowed when `viewTopRef` is `"level_above"`. */
+    viewTopMm: z.number().finite().min(-30000).max(60000).nullable(),
+    /** null: reset to default automatic/associated behavior. */
+    viewTopRef: z.enum(VIEW_TOP_REFS).nullable(),
+    /** null: detach any bound view template. */
+    viewTemplateId: id.nullable(),
+    /** null: clear explicit browser group. */
+    browserGroup: z.string().trim().min(1).max(80).nullable(),
+    /** null: clear explicit browser sort order. */
+    sortOrder: z.number().finite().nullable(),
     discipline: disciplineSchema.nullable(),
     hiddenCategories: z.array(z.enum(VIEW_CATEGORIES)).max(VIEW_CATEGORIES.length),
+    hiddenElementIds: z.array(id).max(5000),
+    showClearanceLabels: z.boolean(),
+    hideDeviceMarks: z.boolean(),
     hiddenDraftingCategories: z.array(z.enum(DRAFTING_CATEGORIES)).max(DRAFTING_CATEGORIES.length),
     references: z.record(id, referenceDisplaySchema),
     linkedHiddenLines: z.boolean(),
     linkedMinObjectMm: z.number().finite().min(0).max(3000),
     detailLevel: z.enum(["coarse", "medium", "fine"]),
+    showLineCodes: z.boolean(),
+    offsetStackedRuns: z.boolean(),
+    showReferenceDisciplines: z.array(z.string().min(1).max(64)).max(20),
+    /** Plans: multiplier for annotative paper-space symbols and `minPaperMm` floors (0.5–3.0). */
+    symbolScale: z.number().finite().min(0.5).max(3),
     visualStyle: z.enum(VISUAL_STYLES),
     showHiddenLines: z.boolean(),
     hiddenLineCategories: z.array(z.enum(VIEW_CATEGORIES)).max(VIEW_CATEGORIES.length),
@@ -247,9 +288,13 @@ const viewPropsPatchObject = z
     cutPattern: z.enum(CUT_PATTERNS),
     section: sectionSchema,
     cropView: z.boolean(),
+    /** Optional closed polygonal crop boundary (model mm, >= 3 vertices); null resets to the plain rectangle. */
+    cropPolygon: z.array(vec2).min(3).max(200).nullable(),
     showCropBox: z.boolean(),
     annotationCrop: z.boolean(),
     annotationCropOffsetMm: z.number().finite().min(0).max(100),
+    levelLeftExtMm: z.number().finite().min(-20).max(120),
+    levelRightExtMm: z.number().finite().min(-20).max(120),
     phaseId: id,
     phaseFilterId: id,
     groupDisplay: z.record(id, z.enum(["show", "halftone", "hide"])),
@@ -299,7 +344,7 @@ const crop = z.object({ min: vec2, max: vec2 });
 
 const fields = z.record(z.string().min(1).max(40), z.string().max(200));
 
-const drawingShape = z.enum(["text", "line", "rect", "cloud", "dimension", "tag", "arc", "circle", "polyline", "spline", "region", "component", "repeat", "batt", "callout", "figure", "field_block"]);
+const drawingShape = z.enum(["text", "line", "rect", "cloud", "dimension", "tag", "arc", "circle", "polyline", "spline", "region", "component", "repeat", "batt", "callout", "figure", "field_block", "markup"]);
 
 /** What `restore_document_elements` may write back: the four document kinds, as committed. */
 // Restore puts back a record as stored, so it reads any stored discipline; the partition write gate refuses a new one the server can't store.
@@ -310,10 +355,20 @@ const documentRecord = z.discriminatedUnion("kind", [
     ...base,
     kind: z.literal("view"),
     name,
-    viewType: z.enum(["floor_plan", "ceiling_plan", "section", "three_d", "schedule", "detail"]),
+    viewType: z.enum(["floor_plan", "ceiling_plan", "section", "elevation", "three_d", "schedule", "detail"]),
     cropMin: vec2,
     cropMax: vec2,
-    props: viewPropsPatchObject.extend({ discipline: disciplineSchema, workingAngleDeg: z.number().finite().min(-45).max(45), viewBottomMm: z.number().finite().min(-30000).max(30000), viewTopMm: z.number().finite().min(0).max(60000), ...view3dPropsShape }).partial().optional(),
+    props: viewPropsPatchObject.extend({ discipline: disciplineSchema, workingAngleDeg: z.number().finite().min(-45).max(45), viewBottomMm: z.number().finite().min(-30000).max(30000), viewTopMm: z.number().finite().min(-30000).max(60000), viewTopRef: z.enum(VIEW_TOP_REFS), browserGroup: z.string().trim().min(1).max(80), sortOrder: z.number().finite(), viewTemplateId: id.transform(asElementId), cropPolygon: z.array(vec2).min(3).max(200).readonly(), ...view3dPropsShape }).partial().optional(),
+  }),
+  z.object({
+    ...base,
+    kind: z.literal("view_template"),
+    name,
+    description: z.string().max(400).optional(),
+    viewTypes: z.array(z.enum(["floor_plan", "ceiling_plan", "section", "elevation", "three_d", "detail", "schedule"])).max(7).optional(),
+    locks: z.array(z.enum(VIEW_TEMPLATE_LOCK_KEYS)).max(VIEW_TEMPLATE_LOCK_KEYS.length),
+    props: viewPropsPatchObject.extend({ discipline: disciplineSchema, workingAngleDeg: z.number().finite().min(-45).max(45), viewBottomMm: z.number().finite().min(-30000).max(30000), viewTopMm: z.number().finite().min(-30000).max(60000), viewTopRef: z.enum(VIEW_TOP_REFS), browserGroup: z.string().trim().min(1).max(80), sortOrder: z.number().finite() }).partial(),
+    sourceLibraryId: z.string().min(1).max(200).optional(),
   }),
   z.object({
     ...base,
@@ -321,9 +376,9 @@ const documentRecord = z.discriminatedUnion("kind", [
     number: z.string().min(1).max(40),
     title: z.string().min(1).max(200),
     viewIds: z.array(id).max(500),
-    props: z.object({ titleBlock: z.enum(TITLE_BLOCK_TYPES).optional(), titleBlockRow: titleBlockRowSchema.optional(), fields: fields.optional(), revisions: revisionsSchema.optional() }).optional(),
+    props: z.object({ titleBlock: z.enum(TITLE_BLOCK_TYPES).optional(), titleBlockRow: titleBlockRowSchema.optional(), fields: fields.optional(), revisions: revisionsSchema.optional(), discipline: z.string().min(1).max(64).optional(), group: z.string().min(1).max(80).optional(), sortOrder: z.number().finite().optional() }).optional(),
   }),
-  z.object({ ...base, kind: z.literal("viewport"), sheetId: id, viewId: id, center: vec2, size: vec2, scale, northArrow: z.boolean().optional() }),
+  z.object({ ...base, kind: z.literal("viewport"), sheetId: id, viewId: id, center: vec2, size: vec2, scale, northArrow: z.boolean().optional(), northArrowOffsetMm: vec2.optional(), titleOffsetMm: vec2.optional(), titleRuleMm: z.number().finite().min(20).max(600).optional() }),
   z.object({
     ...base,
     kind: z.literal("drawing_item"),
@@ -347,23 +402,50 @@ const documentRecord = z.discriminatedUnion("kind", [
     pinned: z.boolean().optional(),
     figure: sheetFigureSchema.optional(),
     block: fieldBlockSpecSchema.optional(),
+    markup: sheetMarkupSpecSchema.optional(),
   }),
 ]);
 type DocumentRecord = z.infer<typeof documentRecord>;
 
-/** A view, sheet, viewport or drawing item as `restore_document_elements` takes it back (null for any other kind). */
+/** A view, view template, sheet, viewport or drawing item as `restore_document_elements` takes it back (null for any other kind). */
 export function toDocumentRecord(el: BimElement): DocumentRecord | null {
-  if (el.kind !== "view" && el.kind !== "sheet" && el.kind !== "viewport" && el.kind !== "drawing_item") return null;
+  if (el.kind !== "view" && el.kind !== "view_template" && el.kind !== "sheet" && el.kind !== "viewport" && el.kind !== "drawing_item") return null;
   const parsed = documentRecord.safeParse(JSON.parse(canonicalJson(el)));
   return parsed.success ? parsed.data : null;
 }
 
+const viewTemplateTypeEnum = z.enum(["floor_plan", "ceiling_plan", "section", "elevation", "three_d", "detail", "schedule"]);
+const viewTemplateLockEnum = z.enum(VIEW_TEMPLATE_LOCK_KEYS);
+
 export const viewCommandSchemas = [
+  z.object({
+    type: z.literal("create_view_template"),
+    viewTemplateId: id,
+    name,
+    description: z.string().max(400).optional(),
+    viewTypes: z.array(viewTemplateTypeEnum).max(7).optional(),
+    locks: z.array(viewTemplateLockEnum).max(VIEW_TEMPLATE_LOCK_KEYS.length),
+    props: viewPropsPatch,
+    sourceLibraryId: z.string().min(1).max(200).optional(),
+  }),
+  z.object({
+    type: z.literal("update_view_template"),
+    viewTemplateId: id,
+    name: name.optional(),
+    description: z.string().max(400).nullable().optional(),
+    viewTypes: z.array(viewTemplateTypeEnum).max(7).nullable().optional(),
+    locks: z.array(viewTemplateLockEnum).max(VIEW_TEMPLATE_LOCK_KEYS.length).optional(),
+    props: viewPropsPatch.optional(),
+  }),
+  z.object({
+    type: z.literal("delete_view_template"),
+    viewTemplateId: id,
+  }),
   z.object({
     type: z.literal("create_view"),
     viewId: id,
     name,
-    viewType: z.enum(["floor_plan", "ceiling_plan", "section", "three_d", "detail", "schedule"]),
+    viewType: z.enum(["floor_plan", "ceiling_plan", "section", "elevation", "three_d", "detail", "schedule"]),
     crop: crop.optional(),
     props: viewPropsPatch.optional(),
   }),
@@ -381,12 +463,17 @@ export const viewCommandSchemas = [
     viewId: id,
     /** The crop box in the view's own frame: plan mm; sections along-cut mm by elevation mm. */
     crop: crop.optional(),
+    /** Optional custom closed polygon crop boundary (model mm, >= 3 vertices); null clears back to rectangular crop. */
+    cropPolygon: z.array(vec2).min(3).max(200).nullable().optional(),
     /** Set the crop box to fit the view's content (model on its level, or a detail view's drawing). */
     fit: z.literal(true).optional(),
     cropView: z.boolean().optional(),
     showCropBox: z.boolean().optional(),
     annotationCrop: z.boolean().optional(),
     annotationCropOffsetMm: z.number().finite().min(0).max(100).optional(),
+    levelLeftExtMm: z.number().finite().min(-20).max(120).optional(),
+    levelRightExtMm: z.number().finite().min(-20).max(120).optional(),
+    section: sectionSchema.optional(),
     /** Sections only: how far beyond the cut line the section sees, mm. */
     farClipMm: z.number().positive().max(300000).optional(),
     /** Placed on a sheet: keep the viewport's centre where it is instead of moving it so the model stays put on paper. */
@@ -402,6 +489,9 @@ export const viewCommandSchemas = [
     titleBlockRow: titleBlockRowSchema.optional(),
     fields: fields.optional(),
     revisions: revisionsSchema.optional(),
+    discipline: z.string().trim().min(1).max(64).optional(),
+    group: z.string().trim().min(1).max(80).optional(),
+    sortOrder: z.number().finite().optional(),
   }),
   z.object({
     type: z.literal("set_sheet_properties"),
@@ -414,15 +504,20 @@ export const viewCommandSchemas = [
     fields: fields.optional(),
     /** The whole revision table, oldest first (replaces it). */
     revisions: revisionsSchema.optional(),
+    discipline: z.string().trim().min(1).max(64).nullable().optional(),
+    group: z.string().trim().min(1).max(80).nullable().optional(),
+    sortOrder: z.number().finite().nullable().optional(),
   }),
   z.object({ type: z.literal("delete_sheet"), sheetId: id }),
-  z.object({ type: z.literal("place_viewport"), viewportId: id, sheetId: id, viewId: id, center: vec2, scale: scale.optional() }),
+  z.object({ type: z.literal("place_viewport"), viewportId: id, sheetId: id, viewId: id, center: vec2, scale: scale.optional(), northArrowOffsetMm: vec2.optional(), titleOffsetMm: vec2.optional(), titleRuleMm: z.number().finite().min(20).max(600).optional() }),
   z.object({ type: z.literal("move_viewport"), viewportId: id, center: vec2 }),
   /** Drag the frame's edges: the view's crop box follows at the viewport's scale. `center` moves the frame too (one edge dragged). */
   z.object({ type: z.literal("resize_viewport"), viewportId: id, size: vec2, center: vec2.optional() }),
   z.object({ type: z.literal("set_viewport_scale"), viewportId: id, scale }),
-  /** Show or hide the viewport's north arrow (it turns itself to true north). */
-  z.object({ type: z.literal("set_viewport_north_arrow"), viewportId: id, show: z.boolean() }),
+  /** Show, hide, or reposition the viewport's north arrow on its sheet (it turns itself to true north). */
+  z.object({ type: z.literal("set_viewport_north_arrow"), viewportId: id, show: z.boolean().optional(), offsetMm: vec2.nullable().optional() }),
+  /** Move a placed viewport's title block on its sheet and/or adjust its horizontal title rule length (Revit viewport title grips). */
+  z.object({ type: z.literal("set_viewport_title"), viewportId: id, titleOffsetMm: vec2.optional(), titleRuleMm: z.number().finite().min(20).max(600).nullable().optional() }),
   z.object({ type: z.literal("remove_viewport"), viewportId: id }),
   z.object({
     type: z.literal("add_drawing_item"),
@@ -510,13 +605,16 @@ export function isViewCommand(command: { readonly type: string }): command is Vi
 
 // ── Document index ───────────────────────────────────────────────────────────
 
-/** Live (not deleted) views, sheets and what is placed on each, for one element record. */
+/** Live (not deleted) views, view templates, sheets and what is placed on each, for one element record. */
 export interface DocumentIndex {
   readonly views: readonly ViewElement[];
+  readonly viewTemplates: readonly ViewTemplateElement[];
   readonly sheets: readonly Sheet[];
   readonly viewportsBySheet: ReadonlyMap<string, readonly Viewport[]>;
   readonly viewportByView: ReadonlyMap<string, Viewport>;
   readonly itemsByOwner: ReadonlyMap<string, readonly DrawingItem[]>;
+  /** Non-printing review markups (`shape === "markup"`) grouped by sheet id, separate from CAD drawing items. */
+  readonly markupsBySheet: ReadonlyMap<string, readonly DrawingItem[]>;
 }
 
 const indexes = new WeakMap<object, DocumentIndex>();
@@ -530,14 +628,19 @@ export function documentIndex(model: Pick<ModelState, "elements" | "connections"
   const cached = indexes.get(model.elements);
   if (cached) return cached;
   const views: ViewElement[] = [];
+  const viewTemplates: ViewTemplateElement[] = [];
   const sheets: Sheet[] = [];
   const viewportsBySheet = new Map<string, Viewport[]>();
   const viewportByView = new Map<string, Viewport>();
   const itemsByOwner = new Map<string, DrawingItem[]>();
+  const markupsBySheet = new Map<string, DrawingItem[]>();
   for (const el of partitionMembers(model, (p) => p.zone === DOCUMENT_ZONE)) {
     switch (el.kind) {
       case "view":
         if (!el.deleted) views.push(el);
+        break;
+      case "view_template":
+        if (!el.deleted) viewTemplates.push(el);
         break;
       case "sheet":
         if (!el.deleted) sheets.push(el);
@@ -548,13 +651,16 @@ export function documentIndex(model: Pick<ModelState, "elements" | "connections"
         viewportByView.set(el.viewId, el);
         break;
       case "drawing_item":
-        if (!el.deleted) pushTo(itemsByOwner, el.ownerId, el);
+        if (!el.deleted) {
+          if (el.shape === "markup") pushTo(markupsBySheet, el.ownerId, el);
+          else pushTo(itemsByOwner, el.ownerId, el);
+        }
         break;
       default:
         break;
     }
   }
-  const built: DocumentIndex = { views, sheets, viewportsBySheet, viewportByView, itemsByOwner };
+  const built: DocumentIndex = { views, viewTemplates, sheets, viewportsBySheet, viewportByView, itemsByOwner, markupsBySheet };
   indexes.set(model.elements, built);
   return built;
 }
@@ -581,8 +687,8 @@ export function matchingPlanCrop(model: Pick<ModelState, "elements" | "connectio
   return found ? { min: found.cropMin, max: found.cropMax } : null;
 }
 
-const isDocument = (el: BimElement | undefined): el is ViewElement | Sheet | Viewport | DrawingItem =>
-  el !== undefined && (el.kind === "view" || el.kind === "sheet" || el.kind === "viewport" || el.kind === "drawing_item");
+const isDocument = (el: BimElement | undefined): el is ViewElement | ViewTemplateElement | Sheet | Viewport | DrawingItem =>
+  el !== undefined && (el.kind === "view" || el.kind === "view_template" || el.kind === "sheet" || el.kind === "viewport" || el.kind === "drawing_item");
 
 function withoutId<T extends { readonly id: ElementId }>(list: readonly T[], elementId: string): T[] {
   return list.filter((x) => x.id !== elementId);
@@ -614,10 +720,12 @@ function shareDocumentIndex(from: Readonly<Record<string, BimElement>>, to: Pick
   const prev = indexes.get(from);
   if (!prev || indexes.has(to.elements)) return;
   let views = prev.views;
+  let viewTemplates = prev.viewTemplates;
   let sheets = prev.sheets;
   const viewportsBySheet = new Map(prev.viewportsBySheet);
   const viewportByView = new Map(prev.viewportByView);
   const itemsByOwner = new Map(prev.itemsByOwner);
+  const markupsBySheet = new Map(prev.markupsBySheet);
   for (const elementId of changedIds) {
     const before = from[elementId];
     const after = to.elements[elementId];
@@ -625,6 +733,18 @@ function shareDocumentIndex(from: Readonly<Record<string, BimElement>>, to: Pick
     if (before && after && before.kind !== after.kind) return;
     const beforeLive = isDocument(before) && !before.deleted;
     const afterLive = isDocument(after) && !after.deleted;
+    if (after?.kind === "view_template" || before?.kind === "view_template") {
+      if (beforeLive && afterLive && after.kind === "view_template") {
+        const next = replaced(viewTemplates, after);
+        if (!next) return;
+        viewTemplates = next;
+      } else if (beforeLive) viewTemplates = withoutId(viewTemplates, elementId);
+      else if (afterLive && after.kind === "view_template") {
+        if (before) return;
+        viewTemplates = [...viewTemplates, after];
+      }
+      continue;
+    }
     if (after?.kind === "view" || before?.kind === "view") {
       if (beforeLive && afterLive && after.kind === "view") {
         const next = replaced(views, after);
@@ -674,21 +794,22 @@ function shareDocumentIndex(from: Readonly<Record<string, BimElement>>, to: Pick
     }
     const b = before?.kind === "drawing_item" ? before : undefined;
     const a = after?.kind === "drawing_item" ? after : undefined;
-    if (b && a && b.ownerId !== a.ownerId) return;
+    if (b && a && (b.ownerId !== a.ownerId || (b.shape === "markup") !== (a.shape === "markup"))) return;
     const ownerId = (a ?? b)?.ownerId;
     if (!ownerId) return;
-    const list = itemsByOwner.get(ownerId) ?? [];
+    const bucket = (a ?? b)?.shape === "markup" ? markupsBySheet : itemsByOwner;
+    const list = bucket.get(ownerId) ?? [];
     if (beforeLive && afterLive && a) {
       const next = replaced(list, a);
       if (!next) return;
-      itemsByOwner.set(ownerId, next);
-    } else if (beforeLive) setOrDrop(itemsByOwner, ownerId, withoutId(list, elementId));
+      bucket.set(ownerId, next);
+    } else if (beforeLive) setOrDrop(bucket, ownerId, withoutId(list, elementId));
     else if (afterLive && a) {
       if (b) return;
-      itemsByOwner.set(ownerId, [...list, a]);
+      bucket.set(ownerId, [...list, a]);
     }
   }
-  indexes.set(to.elements, { views, sheets, viewportsBySheet, viewportByView, itemsByOwner });
+  indexes.set(to.elements, { views, viewTemplates, sheets, viewportsBySheet, viewportByView, itemsByOwner, markupsBySheet });
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -701,7 +822,7 @@ function fail(message: string, ids: readonly string[] = [], code: "invalid_value
   throw new KernelError(code, message, ids.map(asElementId));
 }
 
-function live<K extends "view" | "sheet" | "viewport" | "drawing_item">(reader: TrackedReader, elementId: string, kind: K, label: string): Extract<BimElement, { kind: K }> {
+function live<K extends "view" | "view_template" | "sheet" | "viewport" | "drawing_item">(reader: TrackedReader, elementId: string, kind: K, label: string): Extract<BimElement, { kind: K }> {
   const el = reader.find(asElementId(elementId));
   if (!el || ("deleted" in el && el.deleted)) fail(`${label} no longer exists. Someone may have removed it.`, [elementId], "element_not_found");
   if (!isKind(el, kind)) fail(`${elementId} is a ${el.kind}, not a ${label.toLowerCase()}`, [elementId], "wrong_kind");
@@ -732,8 +853,22 @@ function replacedScheduleKinds(current: ViewProps | undefined, patch: z.infer<ty
 
 /** Patch fields replace; `discipline: null` clears the discipline (everything prints in ink). */
 function mergeProps(current: ViewProps | undefined, patch: z.infer<typeof viewPropsPatch>): ViewProps {
-  const { discipline, workingAngleDeg, viewBottomMm, viewTopMm, categoryOverrides, ...rest } = patch;
+  const { discipline, workingAngleDeg, viewBottomMm, viewTopMm, viewTopRef, viewTemplateId, browserGroup, sortOrder, categoryOverrides, cropPolygon, hiddenElementIds, ...rest } = patch;
   let merged: ViewProps = { ...current, ...rest };
+  if (hiddenElementIds !== undefined) {
+    const { hiddenElementIds: _oldHidden, ...withoutHidden } = merged;
+    const deduped = [...new Set(hiddenElementIds)];
+    merged = deduped.length === 0 ? withoutHidden : { ...withoutHidden, hiddenElementIds: deduped };
+  }
+  if (cropPolygon !== undefined) {
+    const { cropPolygon: _oldPoly, ...withoutPoly } = merged;
+    if (cropPolygon === null) {
+      merged = withoutPoly;
+    } else {
+      const cleaned = cleanPolygon(cropPolygon.map(roundVec), 0.5);
+      merged = cleaned.length >= 3 ? { ...withoutPoly, cropPolygon: cleaned } : withoutPoly;
+    }
+  }
   if (categoryOverrides !== undefined) {
     const { categoryOverrides: _old, ...without } = merged;
     merged = Object.keys(categoryOverrides).length === 0 ? without : { ...without, categoryOverrides };
@@ -742,10 +877,10 @@ function mergeProps(current: ViewProps | undefined, patch: z.infer<typeof viewPr
     const { [key]: _replaced, ...without } = merged;
     merged = without;
   }
-  for (const [key, value] of [["viewBottomMm", viewBottomMm], ["viewTopMm", viewTopMm]] as const) {
+  for (const [key, value] of [["viewBottomMm", viewBottomMm], ["viewTopMm", viewTopMm], ["viewTopRef", viewTopRef], ["viewTemplateId", viewTemplateId], ["browserGroup", browserGroup], ["sortOrder", sortOrder]] as const) {
     if (value === undefined) continue;
     const { [key]: _old, ...without } = merged;
-    merged = value === null ? without : { ...without, [key]: value };
+    merged = value === null ? without : { ...without, [key]: key === "viewTemplateId" ? asElementId(String(value)) : value };
   }
   if (workingAngleDeg === null) {
     const { workingAngleDeg: _model, ...withoutOwnAngle } = merged;
@@ -791,6 +926,8 @@ function checkCategoryOverridesPatch(patch: z.infer<typeof viewPropsPatch> | und
   const overrides = patch?.categoryOverrides;
   if (overrides === undefined || Object.keys(overrides).length === 0) return;
   if (!categoryOverridesWritable()) fail("This model server can't save per-category graphics yet, so the change wasn't made. Showing, hiding and pens for the standard categories (Duct, Electrical devices…) still save; an administrator can update the model server.", [viewId]);
+  const usesSchematicDetail = Object.values(overrides).some((ov) => ov.detailLevel !== undefined || ov.singleLineBelowMm !== undefined);
+  if (usesSchematicDetail && !peerReads(VIEW_SCHEMATIC_DETAIL_FEATURE)) fail("Per-category detail levels and single-line size thresholds can't be saved yet: the model server this model is open on is an older version. Try again once it is updated.", [viewId]);
 }
 
 /** A diagram kind is written only when a row in force draws it and the peers read it; a view already holding one keeps it untouched. */
@@ -803,16 +940,35 @@ function checkDiagramKindPatch(patch: z.infer<typeof viewPropsPatch> | undefined
 
 function checkProps(viewType: ViewElement["viewType"], props: ViewProps, viewId: string): void {
   if ((viewType === "floor_plan" || viewType === "ceiling_plan") && !props.level) fail("A plan needs a level. Pick the level it shows.", [viewId]);
-  if (viewType === "section") {
+  if (viewType === "section" || viewType === "elevation") {
     const cut = props.section;
-    if (!cut) fail("A section needs a cut line. Draw it in a plan view.", [viewId]);
-    if (sectionLength(cut) < MIN_SECTION_MM) fail("The section cut line is too short. Draw it at least 1 ft long.", [viewId]);
+    if (!cut) fail(`A ${viewType} needs a cut line. Draw it in a plan view.`, [viewId]);
+    if (sectionLength(cut) < MIN_SECTION_MM) fail(`The ${viewType} line is too short. Draw it at least 1 ft long.`, [viewId]);
   }
-  if (viewType !== "section" && props.section) fail("Only section views have a cut line.", [viewId]);
+  if (viewType !== "section" && viewType !== "elevation" && props.section) fail("Only section and elevation views have a cut line.", [viewId]);
   const isPlan = viewType === "floor_plan" || viewType === "ceiling_plan";
-  if (props.diagram?.hints?.faultCurrent !== undefined && !peerReads(DIAGRAM_FAULT_CURRENT_FEATURE)) fail("Show fault current can't be saved yet: the model server this model is open on is an older version. Try again once it is updated.", [viewId]);
-  if (!isPlan && (props.viewBottomMm !== undefined || props.viewTopMm !== undefined)) fail("Only plans have a top and bottom to what they show. A section's reach is its far clip depth.", [viewId]);
-  if (isPlan && props.viewTopMm !== undefined && props.viewTopMm < (props.cutHeightMm ?? DEFAULT_CUT_HEIGHT_MM)) fail(`The top of the view must be at or above the cut height (${Math.round((props.cutHeightMm ?? DEFAULT_CUT_HEIGHT_MM) / 30.48) / 10} ft).`, [viewId]);
+  if (props.diagram?.hints?.faultCurrent !== undefined && !peerReads(DIAGRAM_FAULT_CURRENT_FEATURE)) fail("Show fault current can't be saved yet: the model server this model is open on is an older version. Try again once the server is updated.", [viewId]);
+  if (props.diagram?.hints?.showLinkLoads !== undefined && !peerReads(DIAGRAM_LINK_LOADS_FEATURE)) fail("Show link loads can't be saved yet: the model server this model is open on is an older version. Try again once the server is updated.", [viewId]);
+  if (
+    (props.diagram?.hints?.minLoadRatingA !== undefined ||
+      props.diagram?.hints?.phaseScope !== undefined ||
+      props.diagram?.hints?.includeEquipmentIds !== undefined ||
+      props.diagram?.hints?.excludeEquipmentIds !== undefined) &&
+    !peerReads(DIAGRAM_FILTERS_FEATURE)
+  ) {
+    fail("Diagram filters can't be saved yet: the model server this model is open on is an older version. Try again once the server is updated.", [viewId]);
+  }
+  if (props.showLineCodes !== undefined && !peerReads(VIEW_SCHEMATIC_DETAIL_FEATURE)) fail("Inline service code settings can't be saved yet: the model server this model is open on is an older version. Try again once it is updated.", [viewId]);
+  if (props.symbolScale !== undefined && !peerReads(VIEW_SYMBOL_SCALE_FEATURE)) fail("View symbol scale can't be saved yet: the model server this model is open on is an older version. Try again once it is updated.", [viewId]);
+  if (props.hiddenElementIds && props.hiddenElementIds.length > 0 && !peerReads(VIEW_HIDDEN_ELEMENTS_FEATURE)) fail("Hiding individual elements in a view can't be saved yet: the model server this model is open on is an older version. Try again once it is updated.", [viewId]);
+  if ((props.viewTopRef !== undefined || props.browserGroup !== undefined || props.sortOrder !== undefined) && !peerReads(VIEW_RANGE_AND_BROWSER_FEATURE)) {
+    fail("Level-relative view range and browser view organization can't be saved yet: the model server this model is open on is an older version. Try again once it is updated.", [viewId]);
+  }
+  if (props.viewTemplateId !== undefined && !peerReads(VIEW_TEMPLATES_FEATURE)) {
+    fail("View templates can't be saved yet: the model server this model is open on is an older version. Try again once it is updated.", [viewId]);
+  }
+  if (!isPlan && (props.viewBottomMm !== undefined || props.viewTopMm !== undefined || props.viewTopRef !== undefined)) fail("Only plans have a top and bottom to what they show. A section's reach is its far clip depth.", [viewId]);
+  if (isPlan && props.viewTopMm !== undefined && (!props.viewTopRef || props.viewTopRef === "associated_level") && props.viewTopMm < (props.cutHeightMm ?? DEFAULT_CUT_HEIGHT_MM)) fail(`The top of the view must be at or above the cut height (${Math.round((props.cutHeightMm ?? DEFAULT_CUT_HEIGHT_MM) / 30.48) / 10} ft).`, [viewId]);
   if (isPlan && viewType === "floor_plan" && props.viewBottomMm !== undefined && props.viewBottomMm > (props.cutHeightMm ?? DEFAULT_CUT_HEIGHT_MM)) fail(`The bottom of the view must be at or below the cut height (${Math.round((props.cutHeightMm ?? DEFAULT_CUT_HEIGHT_MM) / 30.48) / 10} ft).`, [viewId]);
   if (viewType !== "floor_plan" && viewType !== "ceiling_plan" && props.orientation !== undefined && props.orientation !== "plan_north") fail(props.orientation === "true_north" ? "Only plans turn to true north. Sections, 3D and detail views keep their own direction." : "Only plans turn to the working angle. Sections, 3D and detail views keep their own direction.", [viewId]);
   if (viewType === "schedule") {
@@ -963,6 +1119,9 @@ function checkDetail(shape: DrawingItem["shape"], fields: Pick<DrawingItem, "com
   }
   if (shape === "batt" && !fields.batt) fail("Insulation needs its thickness.", [itemId]);
   if (fields.fill && shape !== "region") fail("Only a region takes a fill.", [itemId]);
+  if (fields.fill && regionFillNeedsCadStandards(fields.fill) && !peerReads(DRAFTING_CAD_STANDARDS_FEATURE)) {
+    fail("Halftone/screened region hatches and extended hatch patterns can't be saved yet: the model server this model is open on is an older version. Try again once it is updated.", [itemId]);
+  }
   if (fields.batt && shape !== "batt") fail("Only insulation takes a thickness.", [itemId]);
   if (fields.component && shape !== "component" && shape !== "repeat") fail("Only a detail component or repeating detail takes a component.", [itemId]);
 }
@@ -1004,7 +1163,7 @@ function checkPoints(shape: DrawingItem["shape"], points: readonly Vec2[], text:
   if (need === 2 && a && b && distance(a, b) < 0.5) fail(`The ${shape} is too small to see. Drag it out further.`, [itemId]);
 }
 
-const MODEL_VIEW_TYPES: ReadonlySet<string> = new Set(["floor_plan", "ceiling_plan", "section"]);
+const MODEL_VIEW_TYPES: ReadonlySet<string> = new Set(["floor_plan", "ceiling_plan", "section", "elevation"]);
 
 /** A callout names a live plan, section or detail view other than the one it is drawn in, and its box has some size. */
 function checkCallout(reader: TrackedReader, shape: DrawingItem["shape"], spec: DrawingItem["callout"], ownerId: string, itemId: string, points: readonly Vec2[]): void {
@@ -1018,6 +1177,14 @@ function checkCallout(reader: TrackedReader, shape: DrawingItem["shape"], spec: 
   if (!target || target.kind !== "view" || target.deleted) fail(`There is no view ${spec.viewId} for the callout to refer to. It may have been deleted.`, [spec.viewId], "element_not_found");
   if (target.viewType === "schedule" || target.viewType === "three_d") fail(`"${target.name}" is a ${target.viewType === "schedule" ? "schedule" : "3D view"}; callouts refer to a plan, section or detail view.`, [spec.viewId], "wrong_kind");
   const [a, b] = points;
+  if (spec.boundary) {
+    const cleaned = cleanPolygon(spec.boundary, 0.5);
+    const bounds = polygonBounds(cleaned);
+    if (cleaned.length < 3 || !bounds || bounds.max.x - bounds.min.x < 1 || bounds.max.y - bounds.min.y < 1) {
+      fail("A polygonal callout boundary needs at least three non-collinear corners with non-zero area.", [itemId]);
+    }
+    return;
+  }
   if (a && b && (Math.abs(a.x - b.x) < 1 || Math.abs(a.y - b.y) < 1)) fail("The callout's box is too small to see. Drag it out further.", [itemId]);
 }
 
@@ -1162,16 +1329,103 @@ export function executeViewCommand(model: ModelState, command: ViewCommand): Exe
     refuseDiagramFrameEdit(model, command);
 
     switch (command.type) {
+      case "create_view_template": {
+        if (!peerReads(VIEW_TEMPLATES_FEATURE)) {
+          fail("View templates can't be saved yet: the model server this model is open on is an older version. Try again once it is updated.", [command.viewTemplateId]);
+        }
+        mustBeNew(model, command.viewTemplateId);
+        checkCategoryOverridesPatch(command.props, command.viewTemplateId);
+        for (const vt of command.viewTypes?.length ? command.viewTypes : (["floor_plan"] as const)) {
+          checkViewGraphicsPatch(vt, command.props, command.viewTemplateId);
+        }
+        const clash = docs().viewTemplates.find((t) => t.name.trim().toLowerCase() === command.name.trim().toLowerCase());
+        if (clash) fail(`A view template named "${clash.name}" already exists. Pick another name.`, [clash.id], "already_exists");
+        const props = mergeProps(undefined, command.props) as ViewTemplateProps;
+        write({
+          ...NEW_META,
+          id: asElementId(command.viewTemplateId),
+          kind: "view_template",
+          name: command.name,
+          ...(command.description !== undefined ? { description: command.description } : {}),
+          ...(command.viewTypes && command.viewTypes.length > 0 ? { viewTypes: [...command.viewTypes] } : {}),
+          locks: [...new Set(command.locks)],
+          props,
+          ...(command.sourceLibraryId ? { sourceLibraryId: command.sourceLibraryId } : {}),
+          partition: documentPartition(undefined, props.discipline),
+        });
+        break;
+      }
+      case "update_view_template": {
+        if (!peerReads(VIEW_TEMPLATES_FEATURE)) {
+          fail("View templates can't be saved yet: the model server this model is open on is an older version. Try again once it is updated.", [command.viewTemplateId]);
+        }
+        const tpl = live(reader, command.viewTemplateId, "view_template", "The view template");
+        if (command.props) {
+          checkCategoryOverridesPatch(command.props, tpl.id);
+          const vts = command.viewTypes === null ? (["floor_plan"] as const) : (command.viewTypes ?? tpl.viewTypes ?? (["floor_plan"] as const));
+          for (const vt of vts.length ? vts : (["floor_plan"] as const)) {
+            checkViewGraphicsPatch(vt, command.props, tpl.id);
+          }
+        }
+        if (command.name !== undefined) {
+          const clash = docs().viewTemplates.find((t) => t.id !== tpl.id && t.name.trim().toLowerCase() === command.name!.trim().toLowerCase());
+          if (clash) fail(`A view template named "${clash.name}" already exists. Pick another name.`, [clash.id], "already_exists");
+        }
+        const nextProps = command.props ? (mergeProps(tpl.props as ViewProps, command.props) as ViewTemplateProps) : tpl.props;
+        const nextLocks = command.locks !== undefined ? [...new Set(command.locks)] : tpl.locks;
+        const nextDesc = command.description === null ? undefined : (command.description ?? tpl.description);
+        const nextViewTypes = command.viewTypes === null ? undefined : (command.viewTypes ?? tpl.viewTypes);
+        const updated: ViewTemplateElement = {
+          ...tpl,
+          name: command.name ?? tpl.name,
+          ...(nextDesc !== undefined ? { description: nextDesc } : { description: undefined }),
+          ...(nextViewTypes && nextViewTypes.length > 0 ? { viewTypes: [...nextViewTypes] } : { viewTypes: undefined }),
+          locks: nextLocks,
+          props: nextProps,
+          partition: documentPartition(undefined, nextProps.discipline),
+        };
+        write(updated);
+        if (command.name !== undefined) authored.push({ elementId: tpl.id, field: F.name, value: updated.name });
+        if (command.locks !== undefined) authored.push({ elementId: tpl.id, field: "doc:locks", value: canonicalJson(updated.locks) });
+        if (command.props) {
+          for (const key of Object.keys(command.props)) {
+            authored.push({ elementId: tpl.id, field: F.prop(key), value: canonicalJson(propValue(updated.props as ViewProps, key)) });
+          }
+        }
+        break;
+      }
+      case "delete_view_template": {
+        const tpl = live(reader, command.viewTemplateId, "view_template", "The view template");
+        // Detach bound views cleanly so deleting a template never leaves dangling template ids.
+        for (const v of docs().views) {
+          if (v.props?.viewTemplateId !== tpl.id) continue;
+          const liveV = live(reader, v.id, "view", "The view");
+          const nextProps = { ...liveV.props };
+          delete (nextProps as Record<string, unknown>).viewTemplateId;
+          write({ ...liveV, props: nextProps });
+          authored.push({ elementId: liveV.id, field: F.prop("viewTemplateId"), value: canonicalJson(undefined) });
+        }
+        write({ ...tpl, deleted: true });
+        authored.push({ elementId: tpl.id, field: F.deleted, value: "true" });
+        break;
+      }
       case "create_view": {
         mustBeNew(model, command.viewId);
         checkCategoryOverridesPatch(command.props, command.viewId);
         checkViewGraphicsPatch(command.viewType, command.props, command.viewId);
         checkDiagramKindPatch(command.props, command.viewId);
+        if (command.props?.viewTemplateId) {
+          const tpl = live(reader, command.props.viewTemplateId, "view_template", "The view template");
+          if (tpl.viewTypes && tpl.viewTypes.length > 0 && !tpl.viewTypes.includes(command.viewType)) {
+            fail(`View template "${tpl.name}" does not apply to ${command.viewType} views.`, [command.viewId, tpl.id]);
+          }
+        }
         const props = withCanonicalLevel(model, defaultViewProps(command.viewType, command.props));
         checkProps(command.viewType, props, command.viewId);
         uniqueViewName(docs(), command.name, null);
-        // No crop given: a plan of a level that already has one starts on that plan's crop, so the two line up on sheets.
-        const c = command.crop ?? matchingPlanCrop(model, command.viewType, props.level) ?? fitCrop(model, { viewType: command.viewType, props }, []);
+        // No crop given: derive from cropPolygon when set, else a matching level plan's crop, else fit content.
+        const polyCrop = props.cropPolygon && props.cropPolygon.length >= 3 ? polygonBounds(props.cropPolygon) : null;
+        const c = command.crop ?? polyCrop ?? matchingPlanCrop(model, command.viewType, props.level) ?? fitCrop(model, { viewType: command.viewType, props }, []);
         checkCrop(c, command.viewId);
         write({
           ...NEW_META,
@@ -1229,6 +1483,12 @@ export function executeViewCommand(model: ModelState, command: ViewCommand): Exe
         checkCategoryOverridesPatch(command.props, view.id);
         checkViewGraphicsPatch(view.viewType, command.props, view.id);
         checkDiagramKindPatch(command.props, view.id, view.props);
+        if (command.props.viewTemplateId) {
+          const tpl = live(reader, command.props.viewTemplateId, "view_template", "The view template");
+          if (tpl.viewTypes && tpl.viewTypes.length > 0 && !tpl.viewTypes.includes(view.viewType)) {
+            fail(`View template "${tpl.name}" does not apply to ${view.viewType} views.`, [view.id, tpl.id]);
+          }
+        }
         const props = withCanonicalLevel(model, mergeProps(view.props, command.props));
         checkProps(view.viewType, props, view.id);
         const organizationProblem = viewOrganizationProblem(model, command.props);
@@ -1240,7 +1500,7 @@ export function executeViewCommand(model: ModelState, command: ViewCommand): Exe
           cropMin = roundVec(command.crop.min);
           cropMax = roundVec(command.crop.max);
           authored.push({ elementId: view.id, field: F.crop, value: canonicalJson({ min: cropMin, max: cropMax }) });
-        } else if (view.viewType === "section" && command.props.section) {
+        } else if ((view.viewType === "section" || view.viewType === "elevation") && command.props.section) {
           // A moved cut line re-crops along its new length.
           const c = sectionDefaultCrop({ props });
           cropMin = c.min;
@@ -1262,10 +1522,10 @@ export function executeViewCommand(model: ModelState, command: ViewCommand): Exe
         const view = live(reader, command.viewId, "view", "The view");
         if (view.viewType === "schedule") fail("A schedule is always as big as its rows; it has no crop box. Change its columns or filters instead.", [view.id]);
         if (command.crop && command.fit) fail("Send a crop box or ask to fit it to the content, not both.", [view.id]);
-        if (command.farClipMm !== undefined && view.viewType !== "section") fail("Only sections have a far clip depth.", [view.id]);
+        if (command.farClipMm !== undefined && view.viewType !== "section" && view.viewType !== "elevation") fail("Only sections and elevations have a far clip depth.", [view.id]);
         const items = viewContentItems(model, view);
         let props: ViewProps = view.props ?? {};
-        const setProp = <K extends "cropView" | "showCropBox" | "annotationCrop" | "annotationCropOffsetMm">(key: K, value: ViewProps[K] | undefined) => {
+        const setProp = <K extends "cropView" | "showCropBox" | "annotationCrop" | "annotationCropOffsetMm" | "levelLeftExtMm" | "levelRightExtMm">(key: K, value: ViewProps[K] | undefined) => {
           if (value === undefined) return;
           props = { ...props, [key]: value };
           authored.push({ elementId: view.id, field: F.prop(key), value: canonicalJson(value) });
@@ -1274,11 +1534,35 @@ export function executeViewCommand(model: ModelState, command: ViewCommand): Exe
         setProp("showCropBox", command.showCropBox);
         setProp("annotationCrop", command.annotationCrop);
         setProp("annotationCropOffsetMm", command.annotationCropOffsetMm);
+        setProp("levelLeftExtMm", command.levelLeftExtMm);
+        setProp("levelRightExtMm", command.levelRightExtMm);
+        if (command.section !== undefined) {
+          props = { ...props, section: command.section };
+          authored.push({ elementId: view.id, field: F.prop("section"), value: canonicalJson(props.section) });
+        }
         if (command.farClipMm !== undefined && props.section) {
           props = { ...props, section: { ...props.section, depthMm: round(command.farClipMm) } };
           authored.push({ elementId: view.id, field: F.prop("section"), value: canonicalJson(props.section) });
         }
-        const wanted = command.crop ?? (command.fit ? fitCrop(model, view, items) : null);
+        let polyBounds: { readonly min: Vec2; readonly max: Vec2 } | null = null;
+        if (command.cropPolygon !== undefined) {
+          if (command.cropPolygon === null) {
+            const { cropPolygon: _drop, ...withoutPoly } = props;
+            props = withoutPoly;
+            authored.push({ elementId: view.id, field: F.prop("cropPolygon"), value: "null" });
+          } else {
+            const cleaned = cleanPolygon(command.cropPolygon.map(roundVec), 0.5);
+            const bounds = polygonBounds(cleaned);
+            if (cleaned.length < 3 || !bounds || bounds.max.x - bounds.min.x < 25.4 || bounds.max.y - bounds.min.y < 25.4) {
+              fail("A polygonal crop boundary needs at least three corners spanning at least 1 in each way.", [view.id]);
+            }
+            props = { ...props, cropPolygon: cleaned };
+            authored.push({ elementId: view.id, field: F.prop("cropPolygon"), value: canonicalJson(cleaned) });
+            polyBounds = bounds;
+            if (command.cropView === undefined && props.cropView === false) setProp("cropView", true);
+          }
+        }
+        const wanted = command.crop ?? polyBounds ?? (command.fit ? fitCrop(model, view, items) : null);
         let cropMin = view.cropMin;
         let cropMax = view.cropMax;
         if (wanted) {
@@ -1325,6 +1609,9 @@ export function executeViewCommand(model: ModelState, command: ViewCommand): Exe
           ...(command.titleBlockRow ? { titleBlockRow: command.titleBlockRow } : {}),
           ...(command.fields ? { fields: command.fields } : {}),
           ...(command.revisions && command.revisions.length > 0 ? { revisions: command.revisions } : {}),
+          ...(command.discipline ? { discipline: command.discipline } : {}),
+          ...(command.group ? { group: command.group } : {}),
+          ...(command.sortOrder !== undefined ? { sortOrder: command.sortOrder } : {}),
         };
         write({ ...NEW_META, id: asElementId(command.sheetId), kind: "sheet", number: command.number, title: command.name, viewIds: [], props, partition: documentPartition(undefined, undefined) });
         break;
@@ -1339,14 +1626,20 @@ export function executeViewCommand(model: ModelState, command: ViewCommand): Exe
         if (command.titleBlock !== undefined) authored.push({ elementId: sheet.id, field: F.titleBlock, value: command.titleBlock });
         if (command.titleBlockRow !== undefined) authored.push({ elementId: sheet.id, field: F.titleBlockRow, value: command.titleBlockRow ? `${command.titleBlockRow.id}@${command.titleBlockRow.revision}` : "" });
         if (command.revisions !== undefined) authored.push({ elementId: sheet.id, field: F.revisions, value: canonicalJson(command.revisions) });
+        if (command.discipline !== undefined) authored.push({ elementId: sheet.id, field: F.sheetDiscipline, value: command.discipline ?? "" });
+        if (command.group !== undefined) authored.push({ elementId: sheet.id, field: F.sheetGroup, value: command.group ?? "" });
+        if (command.sortOrder !== undefined) authored.push({ elementId: sheet.id, field: F.sheetSortOrder, value: command.sortOrder === null ? "" : String(command.sortOrder) });
         const nextFields = { ...(sheet.props?.fields ?? {}) };
         for (const [key, value] of Object.entries(command.fields ?? {})) {
           if (value === "") delete nextFields[key];
           else nextFields[key] = value;
           authored.push({ elementId: sheet.id, field: F.field(key), value });
         }
-        const { titleBlockRow: keptRow, ...keptProps } = sheet.props ?? {};
+        const { titleBlockRow: keptRow, discipline: keptDisc, group: keptGroup, sortOrder: keptSort, ...keptProps } = sheet.props ?? {};
         const row = command.titleBlockRow === undefined ? keptRow : command.titleBlockRow ?? undefined;
+        const disc = command.discipline === undefined ? keptDisc : command.discipline ?? undefined;
+        const grp = command.group === undefined ? keptGroup : command.group ?? undefined;
+        const sortOrd = command.sortOrder === undefined ? keptSort : command.sortOrder ?? undefined;
         const next: Sheet = {
           ...sheet,
           number: command.number ?? sheet.number,
@@ -1357,6 +1650,9 @@ export function executeViewCommand(model: ModelState, command: ViewCommand): Exe
             ...(command.titleBlock ? { titleBlock: command.titleBlock } : {}),
             fields: nextFields,
             ...(command.revisions !== undefined ? { revisions: command.revisions } : {}),
+            ...(disc ? { discipline: disc } : {}),
+            ...(grp ? { group: grp } : {}),
+            ...(sortOrd !== undefined ? { sortOrder: sortOrd } : {}),
           },
         };
         write(next);
@@ -1371,6 +1667,10 @@ export function executeViewCommand(model: ModelState, command: ViewCommand): Exe
           write({ ...vp, deleted: true });
         }
         for (const item of docs().itemsByOwner.get(sheet.id) ?? []) {
+          reader.find(item.id);
+          write({ ...item, deleted: true });
+        }
+        for (const item of docs().markupsBySheet.get(sheet.id) ?? []) {
           reader.find(item.id);
           write({ ...item, deleted: true });
         }
@@ -1389,6 +1689,9 @@ export function executeViewCommand(model: ModelState, command: ViewCommand): Exe
           const other = model.elements[existing.sheetId];
           fail(`${label(view)} is already on ${other?.kind === "sheet" ? `sheet ${other.number}` : "another sheet"}. A view goes on one sheet; duplicate it to show it again.`, [view.id, existing.id], "in_use");
         }
+        if (command.northArrowOffsetMm !== undefined && !peerReads(VIEWPORT_NORTH_ARROW_OFFSET_FEATURE)) {
+          fail("Viewport north-arrow offsets can't be saved yet: the model server this model is open on is an older version. Try again once it is updated.", [sheet.id]);
+        }
         const s = view.viewType === "schedule" ? 1 : (command.scale ?? view.props?.scale ?? DEFAULT_PLAN_SCALE);
         const vp: Viewport = {
           ...NEW_META,
@@ -1399,6 +1702,9 @@ export function executeViewCommand(model: ModelState, command: ViewCommand): Exe
           center: roundVec(command.center),
           size: framePaperSize(model, view, viewWindowIn(model, view), s),
           scale: s,
+          ...(command.northArrowOffsetMm ? { northArrowOffsetMm: roundVec(command.northArrowOffsetMm) } : {}),
+          ...(command.titleOffsetMm ? { titleOffsetMm: roundVec(command.titleOffsetMm) } : {}),
+          ...(command.titleRuleMm !== undefined ? { titleRuleMm: round(command.titleRuleMm) } : {}),
           partition: sheet.partition,
         };
         checkViewport(sheet, vp);
@@ -1456,8 +1762,48 @@ export function executeViewCommand(model: ModelState, command: ViewCommand): Exe
       }
       case "set_viewport_north_arrow": {
         const vp = live(reader, command.viewportId, "viewport", "The viewport");
-        write({ ...vp, northArrow: command.show });
-        authored.push({ elementId: vp.id, field: F.northArrow, value: String(command.show) });
+        if ((command.offsetMm !== undefined || command.show === undefined) && !peerReads(VIEWPORT_NORTH_ARROW_OFFSET_FEATURE)) {
+          fail("Viewport north-arrow offsets can't be saved yet: the model server this model is open on is an older version. Try again once it is updated.", [vp.id]);
+        }
+        let next = vp;
+        if (command.show !== undefined) {
+          next = { ...next, northArrow: command.show };
+          authored.push({ elementId: vp.id, field: F.northArrow, value: String(command.show) });
+        }
+        if (command.offsetMm !== undefined) {
+          if (command.offsetMm === null) {
+            const { northArrowOffsetMm: _drop, ...rest } = next;
+            next = rest;
+            authored.push({ elementId: vp.id, field: F.northArrowOffsetMm, value: "null" });
+          } else {
+            const northArrowOffsetMm = roundVec(command.offsetMm);
+            next = { ...next, northArrowOffsetMm };
+            authored.push({ elementId: vp.id, field: F.northArrowOffsetMm, value: canonicalJson(northArrowOffsetMm) });
+          }
+        }
+        write(next);
+        break;
+      }
+      case "set_viewport_title": {
+        const vp = live(reader, command.viewportId, "viewport", "The viewport");
+        let next = vp;
+        if (command.titleOffsetMm !== undefined) {
+          const titleOffsetMm = roundVec(command.titleOffsetMm);
+          next = { ...next, titleOffsetMm };
+          authored.push({ elementId: vp.id, field: F.titleOffsetMm, value: canonicalJson(titleOffsetMm) });
+        }
+        if (command.titleRuleMm !== undefined) {
+          if (command.titleRuleMm === null) {
+            const { titleRuleMm: _drop, ...rest } = next;
+            next = rest;
+            authored.push({ elementId: vp.id, field: F.titleRuleMm, value: "null" });
+          } else {
+            const titleRuleMm = round(command.titleRuleMm);
+            next = { ...next, titleRuleMm };
+            authored.push({ elementId: vp.id, field: F.titleRuleMm, value: canonicalJson(titleRuleMm) });
+          }
+        }
+        write(next);
         break;
       }
       case "remove_viewport": {
@@ -1483,7 +1829,8 @@ export function executeViewCommand(model: ModelState, command: ViewCommand): Exe
         if (command.shape === "figure" && (!onSheet || !command.figure)) fail(onSheet ? "A figure needs its chart or picture." : "Charts and pictures go on a sheet.", [command.ownerId], onSheet ? "invalid_value" : "wrong_kind");
         if (command.figure && command.shape !== "figure") fail("Only a figure takes a chart or picture.", [command.itemId]);
         if (command.shape === "field_block") fail("Place a live field block with add_field_block; it checks the template.", [command.itemId]);
-        if (command.shape === "callout" && !(owner.kind === "view" && (owner.viewType === "floor_plan" || owner.viewType === "ceiling_plan" || owner.viewType === "section"))) fail("Callouts mark part of a plan or a section, so they go in one.", [command.ownerId], "wrong_kind");
+        if (command.shape === "markup") fail("Add a sheet review markup with add_sheet_markup.", [command.itemId]);
+        if (command.shape === "callout" && !(owner.kind === "view" && (owner.viewType === "floor_plan" || owner.viewType === "ceiling_plan" || owner.viewType === "section" || owner.viewType === "elevation"))) fail("Callouts mark part of a plan, section or elevation, so they go in one.", [command.ownerId], "wrong_kind");
         const points = command.points.map(roundVec);
         checkPoints(command.shape, points, command.text, command.itemId, command.dim, command.tag);
         checkCallout(reader, command.shape, command.callout, owner.id, command.itemId, points);
@@ -1611,7 +1958,7 @@ export function executeViewCommand(model: ModelState, command: ViewCommand): Exe
         for (const entry of command.items) {
           const current = reader.find(asElementId(entry.elementId));
           if (!current) fail("Nothing to undo: that element is gone.", [entry.elementId], "element_not_found");
-          if (current.kind !== "view" && current.kind !== "sheet" && current.kind !== "viewport" && current.kind !== "drawing_item") {
+          if (current.kind !== "view" && current.kind !== "view_template" && current.kind !== "sheet" && current.kind !== "viewport" && current.kind !== "drawing_item") {
             fail(`Undo here only restores views, sheets and drawing content, not a ${current.kind}.`, [entry.elementId], "wrong_kind");
           }
           if (current.version !== entry.expectedVersion) {
@@ -1636,6 +1983,8 @@ function describe(el: BimElement): string {
   switch (el.kind) {
     case "view":
       return `View "${el.name}"`;
+    case "view_template":
+      return `View template "${el.name}"`;
     case "sheet":
       return `Sheet ${el.number}`;
     case "viewport":
@@ -1654,6 +2003,8 @@ function restoreRecord(before: DocumentRecord, current: BimElement): BimElement 
   const restored = { ...rest, id: asElementId(before.id), version: current.version, authoredRev: current.authoredRev, ...(deleted ? { deleted } : {}) };
   switch (restored.kind) {
     case "view":
+      return restored;
+    case "view_template":
       return restored;
     case "sheet":
       return { ...restored, viewIds: restored.viewIds.map(asElementId) };

@@ -1,3 +1,4 @@
+import { detailItemBounds } from "./annotation/detailing";
 import { noteCornersInModel } from "./annotation/text-note";
 import { DEFAULT_DETAIL_SCALE, type DrawingItem, type ViewProps } from "./documents";
 import { boxOverRect, cameraWindow } from "./view3d";
@@ -72,6 +73,14 @@ export function drawnContentExtent(items: readonly DrawingItem[], scale: number,
       maxX = Math.max(maxX, c.x);
       maxY = Math.max(maxY, c.y);
     }
+    // Detail shapes (circles, arcs, filled regions, components) beyond raw control points.
+    const detail = detailItemBounds(item, (q) => q);
+    if (detail) {
+      minX = Math.min(minX, detail.min.x);
+      minY = Math.min(minY, detail.min.y);
+      maxX = Math.max(maxX, detail.max.x);
+      maxY = Math.max(maxY, detail.max.y);
+    }
   }
   if (!Number.isFinite(minX)) return null;
   return { min: roundVec({ x: minX - marginMm, y: minY - marginMm }), max: roundVec({ x: maxX + marginMm, y: maxY + marginMm }) };
@@ -92,6 +101,7 @@ export function sectionDefaultCrop(view: Pick<ViewElement, "props">): Rect {
 export function fitCrop(model: Pick<ModelState, "elements"> & Partial<Pick<ModelState, "connections">>, view: Pick<ViewElement, "viewType" | "props">, items: readonly DrawingItem[]): Rect {
   switch (view.viewType) {
     case "section":
+    case "elevation":
       return sectionDefaultCrop(view);
     case "detail":
       // A live diagram is drawn at its own size: a paper margin, not a foot of model.

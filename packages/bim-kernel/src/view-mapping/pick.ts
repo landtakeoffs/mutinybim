@@ -1,7 +1,10 @@
 import type { Rect } from "../crop";
-import { otherLevelElementsInRange, viewCropAndWindow } from "../drawing/views";
+import { otherLevelElementsInRange, planViewRangeExcludes, viewCropAndWindow } from "../drawing/views";
+import { columnVerticalSpan } from "../placement/top-tie";
+import { partPlanOutline } from "../drawing/runs";
 import { elementSolid, hull2 } from "../drawing/solids";
-import { modelLevels, viewLevelNames } from "../levels";
+import { spaceOutlines, outlineAreaMm2 } from "../spaces/space-geometry";
+import { modelLevels, viewLevelNames, viewModelLevel } from "../levels";
 import { displayContextOf, displayResolver } from "../organization/model";
 import { sizeHeight, sizeWidth } from "../routing/rules";
 import { straightPiece } from "../routing/fittings/geometry";
@@ -28,13 +31,13 @@ import { kindRowOf } from "../kinds/rows";
  */
 
 /** Kinds a person can select in a drawing (annotations belong to the drafting tools). */
-const PICKABLE = new Set<BimElement["kind"]>(["run_segment", "run_fitting", "part", "wall", "column", "opening", "room", "grid"]);
+const PICKABLE = new Set<BimElement["kind"]>(["run_segment", "run_fitting", "part", "wall", "column", "beam", "component", "opening", "room", "space", "ceiling", "grid"]);
 /** Drawn only in plans (a section draws their cut through solids, which these don't have). */
-const PLAN_ONLY = new Set<BimElement["kind"]>(["opening", "room", "grid"]);
+const PLAN_ONLY = new Set<BimElement["kind"]>(["opening", "room", "space", "ceiling", "grid"]);
 /** Picked only when nothing else is under the pointer (they cover whole rooms and floors). */
-const BACKGROUND = new Set<BimElement["kind"]>(["room", "grid"]);
+const BACKGROUND = new Set<BimElement["kind"]>(["room", "space", "ceiling", "grid"]);
 /** Changes to these never change what a drawing can pick. */
-const INERT = new Set<BimElement["kind"]>(["view", "viewport", "sheet", "drawing_item", "mep_system", "tag", "dimension"]);
+const INERT = new Set<BimElement["kind"]>(["view", "view_template", "viewport", "sheet", "drawing_item", "mep_system", "tag", "dimension"]);
 
 /**
  * True when the kind's row makes its records pickable: `pickShape` says where
@@ -55,6 +58,8 @@ export interface Footprint {
   readonly kind: BimElement["kind"];
   /** Convex outline (counter-clockwise), drawing frame. A strip's is its swept box. */
   readonly poly: readonly Vec2[];
+  /** Cutout polygons inside `poly` (e.g. stairwell holes in a ceiling) excluded from interior hits. */
+  readonly holes?: ReadonlyArray<readonly Vec2[]>;
   /** A straight run's centreline and half-width; picks by distance to the line. */
   readonly strip: { readonly a: Vec2; readonly b: Vec2; readonly half: number } | null;
   readonly min: Vec2;
@@ -83,6 +88,8 @@ export interface ViewPickIndex {
   /** Grid cell → ids. */
   readonly cells: Map<string, Set<string>>;
   readonly big: Set<string>;
+  /** Room id → room-backed space ids shown in this view, so incremental updates invalidate dependent spaces. */
+  readonly roomToSpaces: Map<string, Set<string>>;
 }
 
 export type BoxMode = "window" | "crossing";
@@ -154,6 +161,7 @@ function stripBox(a: Vec2, b: Vec2, half: number): Vec2[] {
 
 interface Build {
   readonly model: ModelState;
+  readonly view: ViewElement;
   readonly mapping: ViewMapping;
   readonly levelZ: ReadonlyMap<string, number>;
 }
@@ -227,21 +235,114 @@ function footprintOf(b: Build, el: BimElement): Footprint | null {
       return make(stripBox(a, bb, 0), pa.depth, pa.depth, { a, b: bb, half: 0 });
     }
     case "opening": {
-      const half = el.width / 2;
-      const pa = at(el.position.x - half, el.position.y, mapping.floorMm);
-      const pb = at(el.position.x + half, el.position.y, mapping.floorMm);
+      const half = Math.max(el.width / 2, 180);
+      const host = b.model.elements[el.hostId];
+      let ux = 1;
+      let uy = 0;
+      let wallHalfT = 100;
+      let zTop = mapping.floorMm + el.height;
+      if (host?.kind === "wall") {
+        const dx = host.end.x - host.start.x;
+        const dy = host.end.y - host.start.y;
+        const len = Math.hypot(dx, dy);
+        if (len > 1e-6) {
+          ux = dx / len;
+          uy = dy / len;
+        }
+        wallHalfT = host.thickness / 2;
+        zTop = mapping.floorMm + host.height + 60;
+      }
+      const pa = at(el.position.x - ux * half, el.position.y - uy * half, zTop);
+      const pb = at(el.position.x + ux * half, el.position.y + uy * half, zTop);
       const a = { x: pa.u, y: pa.v };
       const bb = { x: pb.u, y: pb.v };
-      return make(stripBox(a, bb, 100), pa.depth, pa.depth, { a, b: bb, half: 100 });
+      const pickHalf = Math.max(wallHalfT + 80, 180);
+      return make(stripBox(a, bb, pickHalf), Math.max(pa.depth, pb.depth) + 60, Math.min(pa.depth, pb.depth), { a, b: bb, half: pickHalf });
     }
     case "room": {
       if (el.outline.length < 3) return null;
       const pts = el.outline.map((q) => at(q.x, q.y, mapping.floorMm));
       return make(
-        hull2(pts.map((q) => ({ x: q.u, y: q.v }))),
+        pts.map((q) => ({ x: q.u, y: q.v })),
         mapping.floorMm,
         mapping.floorMm,
       );
+    }
+    case "ceiling": {
+      if (b.view.viewType !== "ceiling_plan" || el.outline.length < 3) return null;
+      const z = (b.levelZ.get(el.levelId) ?? mapping.floorMm) + (el.heightMm ?? 2700);
+      const pts = el.outline.map((q) => at(q.x, q.y, z));
+      const holes = el.holes
+        ?.filter((h) => h.length >= 3)
+        .map((h) => h.map((q) => at(q.x, q.y, z)).map((q) => ({ x: q.u, y: q.v })));
+      const fp = make(
+        pts.map((q) => ({ x: q.u, y: q.v })),
+        z,
+        z,
+      );
+      return holes && holes.length > 0 ? { ...fp, holes } : fp;
+    }
+    case "space": {
+      let best: readonly Vec2[] | null = null;
+      let bestArea = -1;
+      for (const o of spaceOutlines(b.model.elements, el)) {
+        const a = outlineAreaMm2(o);
+        if (a > bestArea) {
+          best = o;
+          bestArea = a;
+        }
+      }
+      if (!best || best.length < 3) return null;
+      const pts = best.map((q) => at(q.x, q.y, mapping.floorMm));
+      return make(
+        pts.map((q) => ({ x: q.u, y: q.v })),
+        mapping.floorMm,
+        mapping.floorMm,
+      );
+    }
+    case "part": {
+      const pts: Vec2[] = [];
+      let depth = -Infinity;
+      let far = Infinity;
+      const solid = elementSolid(b.model, el, mapping.floorMm);
+      if (solid) {
+        for (const piece of solid.pieces) {
+          for (const q of [...piece.r0, ...piece.r1]) {
+            const d = mapping.toDrawing(q);
+            pts.push({ x: d.u, y: d.v });
+            if (d.depth > depth) depth = d.depth;
+            if (d.depth < far) far = d.depth;
+          }
+        }
+      }
+      // In plans, include the rendered annotative plan symbol bounds so clicking/dragging
+      // a paper-space or minPaperMm-clamped symbol picks the part directly, not only its 3D wall box.
+      if (!section) {
+        const look = elementLook(b.model, b.view, el);
+        const sym = partPlanOutline(b.model, el, {
+          scale: b.view.props?.scale ?? 48,
+          symbolScale: b.view.props?.symbolScale ?? 1,
+          detail: look.detailLevel ?? b.view.props?.detailLevel ?? "medium",
+          planSymbol: look.planSymbol,
+        });
+        if (sym.bounds) {
+          const z = (b.levelZ.get(el.levelId) ?? mapping.floorMm) + (el.offsetMm ?? 0);
+          for (const q of [
+            { x: sym.bounds.min.x, y: sym.bounds.min.y },
+            { x: sym.bounds.max.x, y: sym.bounds.min.y },
+            { x: sym.bounds.max.x, y: sym.bounds.max.y },
+            { x: sym.bounds.min.x, y: sym.bounds.max.y },
+          ]) {
+            const d = at(q.x, q.y, z);
+            pts.push({ x: d.u, y: d.v });
+            if (d.depth > depth) depth = d.depth;
+            if (d.depth < far) far = d.depth;
+          }
+        }
+      }
+      if (pts.length === 0) return null;
+      const poly = hull2(pts);
+      return poly.length > 0 ? make(poly.length < 3 ? stripBox(poly[0] as Vec2, (poly[1] ?? poly[0]) as Vec2, 25) : poly, depth, far) : null;
     }
     default: {
       const solid = elementSolid(b.model, el, mapping.floorMm);
@@ -266,11 +367,29 @@ function footprintOf(b: Build, el: BimElement): Footprint | null {
 /** What the drawing shows of the element (the same filter `drawing/views.ts` draws by). */
 function shownFilter(model: ModelState, view: ViewElement): (el: BimElement) => boolean {
   const names = viewLevelNames(model, view.props?.level, view.props?.levelElevationMm);
+  const level = viewModelLevel(model, view.props?.level, view.props?.levelElevationMm);
   const reached = names ? new Set(otherLevelElementsInRange(model, view).map((el) => el.id)) : null;
+  const outsideRange = planViewRangeExcludes(model, view);
   const display = displayResolver(model, displayContextOf(view));
   return (el) => {
     if (!PICKABLE.has(el.kind) && !rowPicks(el.kind)) return false;
-    if (names && !names.has((el.partition ?? DEFAULT_PARTITION).level) && !reached?.has(el.id)) return false;
+    if (el.kind === "space") {
+      if (level && el.levelId !== level.id) return false;
+    } else if (el.kind === "ceiling") {
+      if (view.viewType !== "ceiling_plan") return false;
+      if (level && el.levelId !== level.id) return false;
+    } else if (names && !names.has((el.partition ?? DEFAULT_PARTITION).level) && !reached?.has(el.id)) {
+      // Match `drawing/views.ts`: continuous columns spanning across this plan's level remain pickable.
+      let spansLevel = false;
+      if (el.kind === "column" && level && (view.viewType === "floor_plan" || view.viewType === "ceiling_plan")) {
+        const ownLvl = el.placement?.levelId ? model.elements[el.placement.levelId] : undefined;
+        const ownFloorMm = ownLvl?.kind === "level" ? ownLvl.elevationMm : 0;
+        const span = columnVerticalSpan(model.elements, el, ownFloorMm);
+        spansLevel = span.baseZMm < level.elevationMm - 1 && span.topZMm > level.elevationMm + 1;
+      }
+      if (!spansLevel) return false;
+    }
+    if (outsideRange?.(el)) return false;
     if (!elementLook(model, view, el).visible) return false;
     return display(el).visible;
   };
@@ -346,6 +465,20 @@ function changedIds(before: ModelState["elements"], after: ModelState["elements"
  * knows which ids an edit touched (a changeset) passes them as `changedHint`
  * and skips the comparison of every record.
  */
+function indexSpaceRooms(roomToSpaces: Map<string, Set<string>>, el: BimElement | undefined, add: boolean): void {
+  if (el?.kind !== "space" || el.bounds.kind !== "rooms") return;
+  for (const rid of el.bounds.roomIds) {
+    let set = roomToSpaces.get(rid);
+    if (add) {
+      if (!set) roomToSpaces.set(rid, (set = new Set()));
+      set.add(el.id);
+    } else if (set) {
+      set.delete(el.id);
+      if (set.size === 0) roomToSpaces.delete(rid);
+    }
+  }
+}
+
 export function buildViewPickIndex(model: ModelState, view: ViewElement, previous?: ViewPickIndex | null, changedHint?: readonly string[]): ViewPickIndex {
   if (previous && previous.viewId === view.id && previous.view === view) {
     if (previous.model.elements === model.elements) return { ...previous, model };
@@ -353,8 +486,12 @@ export function buildViewPickIndex(model: ModelState, view: ViewElement, previou
     const changed = previous.cropOn ? (hinted ?? changedIds(previous.model.elements, model.elements)) : null;
     if (changed) {
       // A straight run's footprint stops at the fittings on its ends: a changed fitting re-measures the runs it joins.
+      // A room-backed space derives its footprint from its referenced rooms: a changed/removed room re-measures its spaces.
       const withLegs = new Set(changed);
+      const roomToSpaces = previous.roomToSpaces;
       for (const id of changed) {
+        const depSpaces = roomToSpaces.get(id);
+        if (depSpaces) for (const sid of depSpaces) withLegs.add(sid);
         for (const el of [model.elements[id], previous.model.elements[id]]) {
           if (el?.kind !== "run_fitting") continue;
           for (const port of el.ports) if (port.link) withLegs.add(port.link.elementId);
@@ -362,8 +499,9 @@ export function buildViewPickIndex(model: ModelState, view: ViewElement, previou
       }
       const footprints = previous.footprints;
       const grid = { cells: previous.cells, big: previous.big };
-      const build: Build = { model, mapping: previous.mapping, levelZ: previous.levelZ };
+      const build: Build = { model, view, mapping: previous.mapping, levelZ: previous.levelZ };
       for (const id of withLegs) {
+        indexSpaceRooms(roomToSpaces, previous.model.elements[id], false);
         const old = footprints.get(id);
         if (old) {
           removeFrom(grid, old);
@@ -371,12 +509,13 @@ export function buildViewPickIndex(model: ModelState, view: ViewElement, previou
         }
         const el = model.elements[id];
         if (!el || !previous.shown(el)) continue;
+        indexSpaceRooms(roomToSpaces, el, true);
         const f = footprintOf(build, el);
         if (!f || !kept(f, previous.mapping, previous.window)) continue;
         footprints.set(id, f);
         addTo(grid, f);
       }
-      return { ...previous, model, footprints, cells: grid.cells, big: grid.big };
+      return { ...previous, model, footprints, cells: grid.cells, big: grid.big, roomToSpaces };
     }
   }
   const mapping = viewMapping(model, view);
@@ -384,19 +523,21 @@ export function buildViewPickIndex(model: ModelState, view: ViewElement, previou
   const levelZ = levelElevations(model);
   const cropOn = view.props?.cropView !== false;
   const empty = { viewId: view.id, view, model, mapping, window, levelZ, cropOn };
-  if (mapping.kind !== "plan" && mapping.kind !== "section") return { ...empty, shown: () => false, footprints: new Map(), cells: new Map(), big: new Set() };
+  if (mapping.kind !== "plan" && mapping.kind !== "section") return { ...empty, shown: () => false, footprints: new Map(), cells: new Map(), big: new Set(), roomToSpaces: new Map() };
   const shown = shownFilter(model, view);
-  const build: Build = { model, mapping, levelZ };
+  const build: Build = { model, view, mapping, levelZ };
   const footprints = new Map<string, Footprint>();
   const grid = { cells: new Map<string, Set<string>>(), big: new Set<string>() };
+  const roomToSpaces = new Map<string, Set<string>>();
   for (const [id, el] of elementEntries(model.elements)) {
     if (!shown(el)) continue;
+    indexSpaceRooms(roomToSpaces, el, true);
     const f = footprintOf(build, el);
     if (!f || !kept(f, mapping, window)) continue;
     footprints.set(id, f);
     addTo(grid, f);
   }
-  return { ...empty, shown, footprints, cells: grid.cells, big: grid.big };
+  return { ...empty, shown, footprints, cells: grid.cells, big: grid.big, roomToSpaces };
 }
 
 function distToSegment(p: Vec2, a: Vec2, b: Vec2): number {
@@ -407,25 +548,30 @@ function distToSegment(p: Vec2, a: Vec2, b: Vec2): number {
   return Math.hypot(p.x - (a.x + dx * t), p.y - (a.y + dy * t));
 }
 
-function insideConvex(p: Vec2, poly: readonly Vec2[]): boolean {
+/** Even-odd ray-casting point-in-polygon (supports both convex and concave/L-shaped rooms, spaces, and ceilings). */
+function insidePoly(p: Vec2, poly: readonly Vec2[]): boolean {
   if (poly.length < 3) return false;
-  let sign = 0;
-  for (let i = 0; i < poly.length; i++) {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
     const a = poly[i] as Vec2;
-    const b = poly[(i + 1) % poly.length] as Vec2;
-    const c = (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
-    if (c === 0) continue;
-    const s = c > 0 ? 1 : -1;
-    if (sign === 0) sign = s;
-    else if (s !== sign) return false;
+    const b = poly[j] as Vec2;
+    if ((a.y > p.y) !== (b.y > p.y) && p.x < ((b.x - a.x) * (p.y - a.y)) / (b.y - a.y) + a.x) {
+      inside = !inside;
+    }
   }
-  return true;
+  return inside;
 }
 
-/** Distance from a drawing point to the footprint (0 inside). */
+/** Distance from a drawing point to the footprint (0 inside, excluding any interior cutout holes). */
 export function footprintDistance(f: Footprint, p: Vec2): number {
   if (f.strip) return Math.max(0, distToSegment(p, f.strip.a, f.strip.b) - f.strip.half);
-  if (insideConvex(p, f.poly)) return 0;
+  if (insidePoly(p, f.poly)) {
+    const hole = f.holes?.find((h) => insidePoly(p, h));
+    if (!hole) return 0;
+    let best = Infinity;
+    for (let i = 0; i < hole.length; i++) best = Math.min(best, distToSegment(p, hole[i] as Vec2, hole[(i + 1) % hole.length] as Vec2));
+    return best;
+  }
   let best = Infinity;
   for (let i = 0; i < f.poly.length; i++) best = Math.min(best, distToSegment(p, f.poly[i] as Vec2, f.poly[(i + 1) % f.poly.length] as Vec2));
   return best;
@@ -479,7 +625,7 @@ function touchesRect(f: Footprint, r: Rect): boolean {
   const inR = (q: Vec2) => q.x >= r.min.x && q.x <= r.max.x && q.y >= r.min.y && q.y <= r.max.y;
   if (f.poly.some(inR)) return true;
   const corners = [r.min, { x: r.max.x, y: r.min.y }, r.max, { x: r.min.x, y: r.max.y }];
-  if (corners.some((c) => insideConvex(c, f.poly))) return true;
+  if (corners.some((c) => insidePoly(c, f.poly))) return true;
   for (let i = 0; i < f.poly.length; i++) {
     const a = f.poly[i] as Vec2;
     const b = f.poly[(i + 1) % f.poly.length] as Vec2;

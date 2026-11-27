@@ -67,6 +67,10 @@ export interface BeamLoadResult {
   readonly endReaction: CaseLoads;
   readonly maxMoment: Quantity<"moment">;
   readonly maxMomentAt: Quantity<"length">;
+  /** Largest elastic bending deflection (positive down), present only when both explicit `E` and catalog `Ix` are available. */
+  readonly maxDeflection?: Quantity<"length">;
+  /** Distance from beam start to `maxDeflection`; present with `maxDeflection`. */
+  readonly maxDeflectionAt?: Quantity<"length">;
 }
 
 export interface ColumnLoadResult {
@@ -154,7 +158,7 @@ function bearingColumn(columns: Buckets<FrameColumn>, beam: FrameBeam, at: Vec2,
   let best: FrameColumn | null = null;
   let bestD = Infinity;
   for (const c of columns.near(at)) {
-    const reaches = c.topLevelId === beam.levelId || Math.abs(c.topZMm - z) <= BEARING_HEIGHT_MM;
+    const reaches = c.topLevelId === beam.levelId || Math.abs(c.topZMm - z) <= BEARING_HEIGHT_MM || (c.baseZMm < z - 100 && z <= c.topZMm + BEARING_HEIGHT_MM);
     const d = dist(c.position, at);
     if (reaches && d <= c.radiusMm + BEARING_SLACK_MM && d < bestD) {
       best = c;
@@ -364,7 +368,14 @@ function build(model: ModelState): Built {
         start = addVectors(start, vectorOf(c, r.startReaction));
         end = addVectors(end, vectorOf(c, r.endReaction));
       }
-      all = simpleBeam({ span, uniform: fromCanonical("line_load", w.deadNPerM + w.liveNPerM), pointLoads: point("equipment") });
+      all = simpleBeam({
+        span,
+        uniform: fromCanonical("line_load", w.deadNPerM + w.liveNPerM),
+        pointLoads: point("equipment"),
+        ...(w.beam.elasticModulus !== null && w.beam.section !== null
+          ? { elasticModulus: w.beam.elasticModulus, momentOfInertia: w.beam.section.ix }
+          : {}),
+      });
     } catch (err) {
       if (!(err instanceof SimpleBeamInputError)) throw err;
       console.error("[struct.load_path] beam skipped", { beamId: w.beam.id, message: err.message });
@@ -393,6 +404,9 @@ function build(model: ModelState): Built {
       endReaction: loads(end),
       maxMoment: all.maxMoment,
       maxMomentAt: all.maxMomentAt,
+      ...(all.maxDeflection !== undefined && all.maxDeflectionAt !== undefined
+        ? { maxDeflection: all.maxDeflection, maxDeflectionAt: all.maxDeflectionAt }
+        : {}),
     });
   }
 

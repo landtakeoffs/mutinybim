@@ -78,6 +78,8 @@ export const diagramHintsSchema = z
     utility: z.boolean(),
     showWarnings: z.boolean(),
     showLoads: z.boolean(),
+    /** Print calculated demand load labels on distribution links (e.g. kVA / flow). Absent: off. */
+    showLinkLoads: z.boolean(),
     labels: z.partialRecord(z.enum(DIAGRAM_LABEL_KINDS), z.array(z.string().max(160)).max(8)),
     title: text,
     notes: z.array(z.string().trim().min(1).max(200)).max(12),
@@ -87,12 +89,26 @@ export const diagramHintsSchema = z
     textOffsets: z.record(z.string().trim().min(1).max(200), z.object({ dx: z.number().finite().min(-5000).max(5000), dy: z.number().finite().min(-5000).max(5000), leader: z.boolean().optional() }).strict()),
     /** Round 12: print the available fault current at each bus. Absent: off. Written only when every peer advertises `DIAGRAM_FAULT_CURRENT_FEATURE`. */
     faultCurrent: z.boolean(),
+    /** How run lengths without an explicit `lengthFt` are resolved (`explicit` = 0 ft worst-case, `shortest` = 3D straight-line, `manhattan` = 3D rectilinear). */
+    lengthMode: z.enum(["explicit", "shortest", "manhattan"]),
+    /** Minimum protective device rating (A) for branch loads / equipment shown on this diagram. Absent or 0: show all. */
+    minLoadRatingA: z.number().finite().min(0).max(10000),
+    /** Renovation/phase scope for this diagram: all equipment, new work only (hides demolished), existing only, or demolition view. */
+    phaseScope: z.enum(["all", "new", "existing", "demolition"]),
+    /** Specific equipment element ids to always include as diagram loads (bypassing minLoadRatingA / showLoads). */
+    includeEquipmentIds: z.array(idSchema).max(200),
+    /** Specific equipment element ids to exclude from diagram loads even when they match minLoadRatingA. */
+    excludeEquipmentIds: z.array(idSchema).max(200),
   })
   .partial()
   .strict();
 
 /** Peers that store and draw a one-line's "Show fault current" (an older peer's strict hints schema refuses the field). */
 export const DIAGRAM_FAULT_CURRENT_FEATURE = "diagrams:fault_current";
+/** Peers that store and evaluate diagram load-rating and phase-scope filters (`minLoadRatingA`, `phaseScope`). */
+export const DIAGRAM_FILTERS_FEATURE = "diagrams:filters";
+/** Peers that store and evaluate distribution link demand-load labels (`showLinkLoads`). */
+export const DIAGRAM_LINK_LOADS_FEATURE = "diagrams:link_loads";
 
 export const diagramDefinitionSchema = z
   .object({ kind: z.string().max(80).regex(DIAGRAM_KIND_ID, "A diagram kind is lower case words with underscores (an add-on's own: <pack>.<name>)."), hints: diagramHintsSchema.optional() })

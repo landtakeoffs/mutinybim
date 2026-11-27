@@ -199,7 +199,16 @@ describe("printing respects the crop", () => {
       const x0 = t.anchor === "start" ? t.at.x : t.anchor === "middle" ? t.at.x - w / 2 : t.at.x - w;
       return [{ x: x0, y: t.at.y - t.size }, { x: x0 + w, y: t.at.y }];
     };
-    const pts = p.kind === "line" ? [p.a, p.b] : p.kind === "text" ? textBox(p) : p.kind === "fill" ? p.points : [p.at, { x: p.at.x + p.size.x, y: p.at.y + p.size.y }];
+    const pts =
+      p.kind === "line"
+        ? [p.a, p.b]
+        : p.kind === "text"
+          ? textBox(p)
+          : p.kind === "fill" || p.kind === "stroke"
+            ? p.points
+            : p.kind === "circle"
+              ? [{ x: p.at.x - p.r, y: p.at.y - p.r }, { x: p.at.x + p.r, y: p.at.y + p.r }]
+              : [p.at, { x: p.at.x + p.size.x, y: p.at.y + p.size.y }];
     return pts.every((q) => q.x >= e.left - pad && q.x <= e.right + pad && q.y >= e.top - pad && q.y <= e.bottom + pad);
   };
 
@@ -209,7 +218,7 @@ describe("printing respects the crop", () => {
     const e = edges(m, "vp-1");
     const scene = buildSheetSceneFor(m, "s-1", { projectName: "P" });
     // The viewport's own content: everything drawn between the sheet border and the viewport title.
-    const anchor = (p: Prim) => (p.kind === "line" ? p.a : p.kind === "fill" ? (p.points[0] ?? { x: 0, y: 0 }) : p.at);
+    const anchor = (p: Prim) => (p.kind === "line" ? p.a : p.kind === "fill" || p.kind === "stroke" ? (p.points[0] ?? { x: 0, y: 0 }) : p.at);
     const near = scene.primitives.filter((p) => anchor(p).y < e.bottom + 2 && anchor(p).x < 700 && !(p.kind === "rect" && p.pen === "heavy"));
     expect(near.length).toBeGreaterThan(0);
     for (const p of near) expect(inFrame(p, e)).toBe(true);

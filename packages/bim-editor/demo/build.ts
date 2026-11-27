@@ -16,7 +16,6 @@ import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { build, type Plugin } from 'esbuild'
 import postcss from 'postcss'
-import tailwind from '@tailwindcss/postcss'
 
 export const DEMO_DIR = path.dirname(fileURLToPath(import.meta.url))
 /** The folder holding every bim-* package (`packages/`). */
@@ -49,6 +48,11 @@ export interface BuildOptions {
   readonly tsconfig?: string
   /** The page script to bundle in place of this demo's entry.tsx (another app hosting the editor). */
   readonly entry?: string
+  /**
+   * Check source times again on each call (the default, for local work). Off: keep the first good
+   * build for the life of the process, as a prebuilt image wants, with no per-request disk scan.
+   */
+  readonly watchSources?: boolean
 }
 
 /** One folder per checkout, so two checkouts on one computer don't share a build. */
@@ -79,6 +83,7 @@ function demoResolve(): Plugin {
 async function buildCss(entry?: string): Promise<string> {
   const base = await readFile(STYLES, 'utf8')
   const source = entry ? `${base}\n@source "${path.relative(DEMO_DIR, entry).split(path.sep).join('/')}";\n` : base
+  const { default: tailwind } = await import('@tailwindcss/postcss')
   const result = await postcss([tailwind({ base: DEMO_DIR })]).process(source, { from: STYLES })
   return result.css
 }
@@ -196,10 +201,15 @@ export function ensureEditorDemoBuilt(options: BuildOptions = {}): Promise<Build
     return buildEditorDemo({ ...options, outDir })
   })()
   pending.set(outDir, next)
-  next.catch((err: unknown) => {
-    console.error('[editor-demo] build failed', err)
-    pending.delete(outDir)
-  })
+  // Share only work in flight; the next request must check source mtimes again,
+  // unless the caller serves a fixed build (`watchSources: false`).
+  next.then(
+    () => { if (options.watchSources !== false) pending.delete(outDir) },
+    (err: unknown) => {
+      console.error('[editor-demo] build failed', err)
+      pending.delete(outDir)
+    },
+  )
   return next
 }
 
